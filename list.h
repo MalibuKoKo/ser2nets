@@ -1,6 +1,6 @@
 /*
- *  ser2net - A program for allowing telnet connection to serial ports
- *  Copyright (C) 2001  Corey Minyard <minyard@acm.org>
+ *  list.h -- list structures
+ *  Copyright (C) 2011  Longshine <longxianghe@gmail.com>
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -17,19 +17,21 @@
  *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
 
-#ifndef CONTROLLER
-#define CONTROLLER
+#ifndef __LIST_H__
+#define __LIST_H__
 
-/* Initialize the controller code, return -1 on error. */
-int controller_init(char *controller_port);
+#define list_is_empty(queue) (NULL == queue)
 
-struct controller_info;
+typedef struct list_node_s {
+  struct list_node_s *next;
+  void *data;
+} list_node_t;
 
-/* Send some output to a controller port.  The data field is the data
-   to write, the count field is the number of bytes to write. */
-void controller_output(struct controller_info *cntlr, char *data, int count);
+int list_insert(list_node_t **queue, list_node_t *node, int (*order)(void *, void *));
+list_node_t* list_remove(list_node_t **queue, list_node_t *node, int (*order)(void *, void *));
+list_node_t* list_remove_data(list_node_t **queue, void *data, int (*order)(void *, void *));
+int list_delete_node(list_node_t *node);
+void list_delete_all(list_node_t *queue);
+list_node_t* list_new_node(void *data);
 
-/* Write some data directly to the controllers output port. */
-void controller_write(struct controller_info *cntlr, char *data, int count);
-
-#endif /* CONTROLLER */
+#endif /* __LIST_H__ */

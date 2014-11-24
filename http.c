@@ -29,11 +29,7 @@
 #include "http.h"
 #include "sha1.h"
 
-#if DEBUG
 #define D(...) printf(__VA_ARGS__);
-#else
-#define D(...)
-#endif
 
 #define IS_WEBSOCKET(hd) hd->websocket_key[0]
 
@@ -45,7 +41,6 @@
 #define WEBSOCKET_OPCODE_CLOSE 0x8
 #define WEBSOCKET_OPCODE_PING 0x9
 #define WEBSOCKET_OPCODE_PONG 0xA
-#define WEBSOCKET_DEFAULT_OPCODE WEBSOCKET_OPCODE_TXT
 
 #define WEBSOCKET_HEADER_SIZE 2
 #define WEBSOCKET_MASK_SIZE 4
@@ -151,7 +146,7 @@ ws_init_frame(ws_frame_t *frm)
   memset(frm, 0, sizeof(ws_frame_t));
   frm->hdr = (ws_hdr_t *) frm->buf;
   frm->hdr->FIN = 1;
-  frm->hdr->opcode = WEBSOCKET_DEFAULT_OPCODE;
+  frm->hdr->opcode = WEBSOCKET_OPCODE_TXT;
   frm->left = -1;
 }
 
@@ -201,31 +196,28 @@ ws_unmask(ws_frame_t *frm)
   }
 }
 
-#if DEBUG
 static void
 ws_print_frame(ws_frame_t *frm)
 {
   int i;
   unsigned char *hdr = (unsigned char *) frm->hdr;
-  D("FIN: %x, RSV1: %d, RSV2: %d, RSV3: %d, opcode: %d, MASK: %d, length: %d\n",
+  printf("FIN: %x, RSV1: %d, RSV2: %d, RSV3: %d, opcode: %d, MASK: %d, length: %d\n",
           frm->hdr->FIN, frm->hdr->RSV1, frm->hdr->RSV2, frm->hdr->RSV3,
-          frm->hdr->opcode, frm->hdr->MASK, WEBSOCKET_LENGTH(frm))
+          frm->hdr->opcode, frm->hdr->MASK, WEBSOCKET_LENGTH(frm));
   if (WEBSOCKET_MASKED(frm) && frm->mask) {
-    D("mask key:")
+    printf("mask key:");
     for (i = 0; i < WEBSOCKET_MASK_SIZE; i++) {
-      D(" %02x", frm->mask[i])
+      printf(" %02x", frm->mask[i]);
     }
-    D("\n")
+    printf("\n");
   }
   if (frm->payload) {
-    D("payload: %s\n", frm->payload)
+    printf("payload: %s\n", frm->payload);
   }
   while (*hdr) {
-    D("%02x ", *(hdr++))
+    printf("%02x ", *(hdr++));
   }
-  D("\n")
 }
-#endif
 
 static int
 get_header_name(char *line, char *name_buf, int len)
@@ -264,10 +256,10 @@ prepare_response_headers(http_data_t *hd, int fd)
     strcat(out, WEBSOCKET_GUID);
     len = sha1(out, strlen(out), tmp, sizeof(tmp));
     base64_encode(tmp, len, out, sizeof(out));
-    hd->response.cursize = sprintf((char *) hd->response.buf, websocket_response_header, out);
+    hd->response_buf_count = sprintf((char *) hd->response_buf, websocket_response_header, out);
   } else {
-    hd->response.cursize = strlen(http_response_header);
-    memcpy(hd->response.buf, http_response_header, hd->response.cursize);
+    hd->response_buf_count = strlen(http_response_header);
+    memcpy(hd->response_buf, http_response_header, hd->response_buf_count);
   }
 }
 
@@ -275,8 +267,7 @@ static void
 send_ws_frame(http_data_t *hd, ws_frame_t *frm)
 {
   //ws_print_frame(frm);
-  buffer_output(&hd->response, (unsigned char *) frm->hdr, WEBSOCKET_FRAME_SIZE(frm));
-  hd->output_ready(hd->cb_data);
+  hd->handle_response(hd->cb_data, (unsigned char *) frm->hdr, WEBSOCKET_FRAME_SIZE(frm));
 }
 
 static void
@@ -295,14 +286,18 @@ send_ws_close_frame(http_data_t *hd)
 void
 http_init(http_data_t *hd, void *cb_data,
           void (*output_ready)(void *),
-          int (*handle_request)(void *, unsigned char *, int))
+          int (*handle_request)(void *, unsigned char *, int),
+          int (*handle_response)(void *, unsigned char *, int))
 {
   hd->state = HTTP_UNCONNECTED;
-  buffer_init(&hd->request, hd->request_buf, sizeof(hd->request_buf));
-  buffer_init(&hd->response, hd->response_buf, sizeof(hd->response_buf));
+  hd->request_buf_count = 0;
+  hd->request_buf_start = 0;
+  hd->response_buf_count = 0;
+  hd->response_buf_start = 0;
   hd->cb_data = cb_data;
   hd->output_ready = output_ready;
   hd->handle_request = handle_request;
+  hd->handle_response = handle_response;
   memset(hd->websocket_key, 0, sizeof(hd->websocket_key));
   ws_init_frame(&hd->ws_frame);
 }
@@ -323,8 +318,7 @@ http_process_response(http_data_t *hd, unsigned char *buf, int len)
     send_ws_frame(hd, &ws_frame);
   } else {
     /* http mode */
-    buffer_output(&hd->response, buf, len);
-    hd->output_ready(hd->cb_data);
+    hd->handle_response(hd->cb_data, buf, len);
   }
   return NULL;
 }
@@ -332,23 +326,23 @@ http_process_response(http_data_t *hd, unsigned char *buf, int len)
 char *
 http_process_request(http_data_t *hd, int fd)
 {
-  unsigned char *ret, *buf = NULL;
+  unsigned char *ret = NULL, *buf = NULL;
   char line[HTTP_BUFSIZE];
   int header_len;
   char header[64];
   char *header_value;
   int i;
 
-  hd->request.cursize = read(fd, hd->request.buf + hd->request.pos, HTTP_BUFSIZE - hd->request.pos);
-  if (hd->request.cursize < 0) {
+  hd->request_buf_count = read(fd, hd->request_buf + hd->request_buf_start, HTTP_BUFSIZE - hd->request_buf_start);
+  if (hd->request_buf_count < 0) {
     /* Got an error on the read, shut down the port. */
     return "tcp read error";
-  } else if (hd->request.cursize == 0) {
+  } else if (hd->request_buf_count == 0) {
     /* The other end closed the port, shut it down. */
     return "tcp read close";
   }
-  hd->request.pos += hd->request.cursize;
-  hd->request.buf[hd->request.pos] = '\0';
+  hd->request_buf_start += hd->request_buf_count;
+  hd->request_buf[hd->request_buf_start] = '\0';
 
   if (HTTP_UNCONNECTED == hd->state) {
     hd->state = HTTP_CONNECTING;
@@ -356,7 +350,7 @@ http_process_request(http_data_t *hd, int fd)
 
   if (HTTP_CONNECTING == hd->state) {
     /* handshaking */
-    buf = hd->request.buf;
+    buf = hd->request_buf;
     for (;;) {
       ret = (unsigned char *) strchr((char *) buf, '\n');
       if (ret) {
@@ -364,7 +358,7 @@ http_process_request(http_data_t *hd, int fd)
         strncpy(line, (char *) buf, header_len);
         line[header_len - 2] = '\0';
 
-        hd->request.pos -= header_len;
+        hd->request_buf_start -= header_len;
         buf = ret + 1;
 
         // TODO process HTTP Method
@@ -374,6 +368,7 @@ http_process_request(http_data_t *hd, int fd)
         if (!strcmp(line, "")) {
           /* request headers over, send response headers */
           prepare_response_headers(hd, fd);
+          hd->handle_response(hd->cb_data, hd->response_buf, hd->response_buf_count);
           hd->state = HTTP_CONNECTED;
           hd->output_ready(hd->cb_data);
           break;
@@ -404,12 +399,12 @@ http_process_request(http_data_t *hd, int fd)
       ws_frame_t *frame = &hd->ws_frame;
       unsigned char *hdr;
 
-      buf = hd->request.buf;
+      buf = hd->request_buf;
       hdr = (unsigned char *)frame->hdr;
 
-      while (hd->request.pos > 0) {
+      while (hd->request_buf_start > 0) {
         hdr[frame->index++] = *(buf++);
-        hd->request.pos--;
+        hd->request_buf_start--;
 
         if (frame->left > 0) {
           frame->left--;
@@ -469,20 +464,17 @@ http_process_request(http_data_t *hd, int fd)
       }
     } else {
       /* pass http payload to dev directly */
-      buf = hd->request.buf;
-      hd->handle_request(hd->cb_data, buf, hd->request.pos);
-      buf += hd->request.pos;
-      hd->request.pos = 0;
+      buf = hd->request_buf;
+      hd->handle_request(hd->cb_data, buf, hd->request_buf_start);
+      buf += hd->request_buf_start;
+      hd->request_buf_start = 0;
     }
   }
 
-  if (buf) {
-    for (i = 0; i < hd->request.pos; i++) {
-      hd->request.buf[i] = buf[i];
-    }
+  for (i = 0; i < hd->request_buf_start; i++) {
+    hd->request_buf[i] = buf[i];
   }
-  hd->request.buf[hd->request.pos] = '\0';
-
+  hd->request_buf[hd->request_buf_start] = '\0';
 
   return NULL;
 }

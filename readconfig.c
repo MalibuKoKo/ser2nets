@@ -28,171 +28,152 @@
 
 #include "dataxfer.h"
 #include "readconfig.h"
-#include "utils.h"
-#include "telnet.h"
 
 #define MAX_LINE_SIZE 256	/* Maximum line length in the config file. */
 
-extern char *config_port;
+#define MAX_BANNER_SIZE 256
 
 static int config_num = 0;
 
+static int banner_continued = 0;
+static char *working_banner_name = NULL;
+static char working_banner[MAX_BANNER_SIZE+1];
+static int working_banner_len = 0;
+static int banner_truncated = 0;
+
 static int lineno = 0;
 
-struct longstr_s
+struct banner_s
 {
     char *name;
     char *str;
-    enum str_type type;
-    struct longstr_s *next;
+    struct banner_s *next;
 };
 
-static struct longstr_s *working_longstr;
-static int working_longstr_continued = 0;
-static int working_longstr_len = 0;
-
-/* All the strings in the system. */
-struct longstr_s *longstrs = NULL;
+/* All the banners in the system. */
+struct banner_s *banners = NULL;
 
 static void
-finish_longstr(void)
+handle_new_banner(void)
 {
-    if (!working_longstr)
-	/* Couldn't allocate memory someplace. */
-	goto out;
+    struct banner_s *new_banner;
 
-    /* On the final alloc an extra byte will be added for the nil char */
-    working_longstr->str[working_longstr_len] = '\0';
+    working_banner[working_banner_len] = '\0';
     
-    working_longstr->next = longstrs;
-    longstrs = working_longstr;
-    working_longstr = NULL;
+    if (banner_truncated)
+	syslog(LOG_ERR, "banner ending on line %d was truncated, max length"
+	       " is %d characters", lineno, MAX_BANNER_SIZE);
+
+    if (!working_banner_name) {
+	syslog(LOG_ERR, "Out of memory handling banner on %d", lineno);
+	goto out;
+    }
+
+    new_banner = malloc(sizeof(*new_banner));
+    if (!new_banner) {
+	syslog(LOG_ERR, "Out of memory handling banner on %d", lineno);
+	free(working_banner_name);
+	goto out;
+    }
+
+    new_banner->name = working_banner_name;
+    new_banner->str = strdup(working_banner);
+    if (!new_banner->str) {
+	syslog(LOG_ERR, "Out of memory handling banner on %d", lineno);
+	free(new_banner->name);
+	free(new_banner);
+	return;
+    }
+
+    new_banner->next = banners;
+    banners = new_banner;
 
  out:
-    working_longstr_len = 0;
+    working_banner_name = NULL;
+    working_banner_len = 0;
+    banner_truncated = 0;
+    banner_continued = 0;
 }
 
-/* Parse the incoming string, it may be on multiple lines. */
+/* Parse the incoming banner, it may be on multiple lines. */
 static void
-handle_longstr(char *name, char *line, enum str_type type)
-{
-    int line_len;
-
-    /* If the user gave an empty string, we get a NULL. */
-    if (!line)
-	line = "";
-
-    line_len = strlen(line);
-
-    working_longstr_continued = (line_len > 0) && (line[line_len-1] == '\\');
-
-    working_longstr = malloc(sizeof(*working_longstr));
-    if (!working_longstr) {
-	syslog(LOG_ERR, "Out of memory handling string on %d", lineno);
-	return;
-    }
-    working_longstr->type = type;
-
-    working_longstr->name = strdup(name);
-    if (!working_longstr->name) {
-	free(working_longstr);
-	working_longstr = NULL;
-	syslog(LOG_ERR, "Out of memory handling longstr on %d", lineno);
-	return;
-    }
-
-    if (working_longstr_continued)
-	line_len--;
-
-    /* Add 1 if it's not continued and thus needs the '\0' */
-    working_longstr->str = malloc(line_len + !working_longstr_continued);
-    if (!working_longstr->str) {
-	free(working_longstr->name);
-	free(working_longstr);
-	working_longstr = NULL;
-	syslog(LOG_ERR, "Out of memory handling longstr on %d", lineno);
-	return;
-    }
-
-    memcpy(working_longstr->str, line, line_len);
-    working_longstr_len = line_len;
-
-    if (!working_longstr_continued)
-	finish_longstr();
-}
-
-static void
-handle_continued_longstr(char *line)
+handle_banner(char *name, char *line)
 {
     int line_len = strlen(line);
-    char *newstr;
+    int real_line_len = line_len;
 
-    working_longstr_continued = (line_len > 0) && (line[line_len-1] == '\\');
+    /* handle a NULL return later. */
+    working_banner_name = strdup(name);
 
-    if (!working_longstr)
-	/* Ran out of memory during processing */
-	goto out;
-
-    if (working_longstr_continued)
-	line_len--;
-
-    /* Add 1 if it's not continued and thus needs the '\0' */
-    newstr = realloc(working_longstr->str, (working_longstr_len + line_len
-					    + !working_longstr_continued));
-    if (!newstr) {
-	free(working_longstr->str);
-	free(working_longstr->name);
-	free(working_longstr);
-	working_longstr = NULL;
-	syslog(LOG_ERR, "Out of memory handling longstr on %d", lineno);
-	goto out;
+    if (line_len >= MAX_BANNER_SIZE) {
+	banner_truncated = 1;
+	line_len = MAX_BANNER_SIZE;
     }
-    working_longstr->str = newstr;
-    memcpy(working_longstr->str + working_longstr_len, line, line_len);
-    working_longstr_len += line_len;
+    memcpy(working_banner, line, line_len);
+    working_banner_len = line_len;
 
-out:
-    if (!working_longstr_continued)
-	finish_longstr();
+    if ((real_line_len > 0) && (line[real_line_len-1] == '\\')) {
+	/* remove the '\' */
+	working_banner_len--;
+	banner_continued = 1;
+    } else {
+	handle_new_banner();
+    }
+
+}
+
+static void
+handle_continued_banner(char *line)
+{
+    int line_len = strlen(line);
+    int real_line_len = line_len;
+
+    if ((line_len + working_banner_len) > MAX_BANNER_SIZE) {
+	banner_truncated = 1;
+	line_len = MAX_BANNER_SIZE - working_banner_len;
+    }
+    memcpy(working_banner+working_banner_len, line, line_len);
+    working_banner_len += line_len;
+
+    if ((real_line_len == 0) || (line[real_line_len-1] != '\\')) {
+	handle_new_banner();
+    } else {
+	/* remove the '\' */
+	working_banner_len--;
+    }
 }
 
 char *
-find_str(char *name, enum str_type *type)
+find_banner(char *name)
 {
-    struct longstr_s *longstr = longstrs;
+    struct banner_s *banner = banners;
 
-    while (longstr) {
-	if (strcmp(name, longstr->name) == 0) {
-	    *type = longstr->type;
-	    return longstr->str;
-	}
-	longstr = longstr->next;
+    while (banner) {
+	if (strcmp(name, banner->name) == 0)
+	    return banner->str;
+	banner = banner->next;
     }
     return NULL;
 }
 
 static void
-free_longstrs(void)
+free_banners(void)
 {
-    struct longstr_s *longstr;
+    struct banner_s *banner;
 
-    if (working_longstr) {
-	if (working_longstr->name)
-	    free(working_longstr->name);
-	if (working_longstr->str)
-	    free(working_longstr->str);
-	free(working_longstr);
-	working_longstr = NULL;
-    }
-    working_longstr_len = 0;
-    working_longstr_continued = 0;
+    if (working_banner_name)
+	free(working_banner_name);
+    working_banner_name = NULL;
+    working_banner_len = 0;
+    banner_truncated = 0;
+    banner_continued = 0;
 
-    while (longstrs) {
-	longstr = longstrs;
-	longstrs = longstrs->next;
-	free(longstr->name);
-	free(longstr->str);
-	free(longstr);
+    while (banners) {
+	banner = banners;
+	banners = banners->next;
+	free(banner->name);
+	free(banner->str);
+	free(banner);
     }
 }
 
@@ -264,32 +245,21 @@ free_tracefiles(void)
     }
 }
 
-static int
-startswith(char *str, const char *test, char **strtok_data)
-{
-    int len = strlen(test);
-
-    if ((strncmp(str, test, len) == 0) && (str[len] == ':')) {
-	strtok_r(str, ":", strtok_data);
-	return 1;
-    }
-    return 0;
-}
 
 void
 handle_config_line(char *inbuf)
 {
-    char *portnum, *state, *timeout, *devname, *devcfg, *comma;
+    char *portnum, *state, *timeout, *devname, *devcfg;
     char *strtok_data = NULL;
     char *errstr;
 
     lineno++;
 
-    if (working_longstr_continued) {
+    if (banner_continued) {
 	char *str = strtok_r(inbuf, "\n", &strtok_data);
 	if (!str)
 	    str = "";
-	handle_continued_longstr(str);
+	handle_continued_banner(str);
 	return;
     }
 
@@ -298,66 +268,24 @@ handle_config_line(char *inbuf)
 	return;
     }
 
-    if (startswith(inbuf, "CONTROLPORT", &strtok_data)) {
-	if (config_port)
-	    /*
-	     * The control port has already been configured either on the
-	     * command line or on a previous statement.  Only take the first.
-	     */
-	    return;
-	config_port = strdup(strtok_r(NULL, "\n", &strtok_data));
-	if (!config_port) {
-	    syslog(LOG_ERR, "Could not allocate memory for CONTROLPORT");
-	    return;
-	}
+    portnum = strtok_r(inbuf, ":", &strtok_data);
+    if (portnum == NULL) {
+	/* An empty line is ok. */
 	return;
     }
 
-    if (startswith(inbuf, "BANNER", &strtok_data)) {
+    if (strcmp(portnum, "BANNER") == 0) {
 	char *name = strtok_r(NULL, ":", &strtok_data);
 	char *str = strtok_r(NULL, "\n", &strtok_data);
 	if (name == NULL) {
 	    syslog(LOG_ERR, "No banner name given on line %d", lineno);
 	    return;
 	}
-	handle_longstr(name, str, BANNER);
+	handle_banner(name, str);
 	return;
     }
 
-    if (startswith(inbuf, "SIGNATURE", &strtok_data)) {
-	char *name = strtok_r(NULL, ":", &strtok_data);
-	char *str = strtok_r(NULL, "\n", &strtok_data);
-	if (name == NULL) {
-	    syslog(LOG_ERR, "No signature given on line %d", lineno);
-	    return;
-	}
-	handle_longstr(name, str, SIGNATURE);
-	return;
-    }
-
-    if (startswith(inbuf, "OPENSTR", &strtok_data)) {
-	char *name = strtok_r(NULL, ":", &strtok_data);
-	char *str = strtok_r(NULL, "\n", &strtok_data);
-	if (name == NULL) {
-	    syslog(LOG_ERR, "No open string name given on line %d", lineno);
-	    return;
-	}
-	handle_longstr(name, str, OPENSTR);
-	return;
-    }
-
-    if (startswith(inbuf, "CLOSESTR", &strtok_data)) {
-	char *name = strtok_r(NULL, ":", &strtok_data);
-	char *str = strtok_r(NULL, "\n", &strtok_data);
-	if (name == NULL) {
-	    syslog(LOG_ERR, "No close string name given on line %d", lineno);
-	    return;
-	}
-	handle_longstr(name, str, CLOSESTR);
-	return;
-    }
-
-    if (startswith(inbuf, "TRACEFILE", &strtok_data)) {
+    if (strcmp(portnum, "TRACEFILE") == 0) {
 	char *name = strtok_r(NULL, ":", &strtok_data);
 	char *str = strtok_r(NULL, "\n", &strtok_data);
 	if (name == NULL) {
@@ -370,21 +298,6 @@ handle_config_line(char *inbuf)
 	}
 	handle_tracefile(name, str);
 	return;
-    }
-
-    comma = strchr(inbuf, ',');
-    if (comma) {
-	if (!strtok_r(comma, ":", &strtok_data)) {
-	    syslog(LOG_ERR, "Invalid port on line %d", lineno);
-	    return;
-	}
-	portnum = inbuf;
-    } else {
-	portnum = strtok_r(inbuf, ":", &strtok_data);
-	if (portnum == NULL) {
-	    /* An empty line is ok. */
-	    return;
-	}
     }
 
     state = strtok_r(NULL, ":", &strtok_data);
@@ -435,7 +348,7 @@ readconfig(char *filename)
 	return -1;
     }
 
-    free_longstrs();
+    free_banners();
     free_tracefiles();
 
     config_num++;

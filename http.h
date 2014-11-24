@@ -20,8 +20,6 @@
 #ifndef __HTTP_H__
 #define __HTTP_H__
 
-#include "buffer.h"
-
 #define HTTP_BUFSIZE    1024
 
 #define HTTP_UNCONNECTED 0
@@ -79,20 +77,24 @@ typedef struct ws_pdu_s {
 typedef struct http_data_s
 {
   int state;
-  struct sbuf request;
+  int request_buf_count;
+  int request_buf_start;
   unsigned char request_buf[HTTP_BUFSIZE];
-  struct sbuf response;
+  int response_buf_count;
+  int response_buf_start;
   unsigned char response_buf[HTTP_BUFSIZE];
   void *cb_data;
   void (*output_ready)(void *cb_data);
   int (*handle_request)(void *cb_data, unsigned char *buf, int size);
+  int (*handle_response)(void *cb_data, unsigned char *buf, int size);
   char websocket_key[32];
   ws_frame_t ws_frame;
 } http_data_t;
 
 void http_init(http_data_t *hd, void *cb_data,
                void (*output_ready)(void *),
-               int (*handle_request)(void *, unsigned char *, int));
+               int (*handle_request)(void *, unsigned char *, int),
+               int (*handle_response)(void *, unsigned char *, int));
 char* http_process_request(http_data_t *hd, int fd);
 char* http_process_response(http_data_t *hd, unsigned char *buf, int len);
 

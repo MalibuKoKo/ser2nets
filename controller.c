@@ -17,7 +17,9 @@
  *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
 
+#include <sys/types.h>
 #include <sys/time.h>
+#include <sys/socket.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
@@ -45,9 +47,7 @@ static char *progname = "ser2net-control";
 
 /* This file holds the code that runs the control port. */
 
-static struct addrinfo *cntrl_ai;
-static int *acceptfds;	/* The file descriptor for the accept port. */
-static unsigned int nr_acceptfds;
+static int acceptfd;	/* The file descriptor for the accept port. */
 
 static int max_controller_ports = 4;	/* How many control connections
 					   do we allow at a time. */
@@ -63,7 +63,7 @@ typedef struct controller_info {
     int            tcpfd;		/* When connected, the file
                                            descriptor for the TCP
                                            port used for I/O. */
-    struct sockaddr_storage remote;	/* The socket address of who
+    struct sockaddr_in remote;		/* The socket address of who
 					   is connected to this port. */
 
     unsigned char inbuf[INBUF_SIZE+1];	/* Buffer to receive command on. */
@@ -228,7 +228,7 @@ controller_output(struct controller_info *cntlr,
 void
 controller_write(struct controller_info *cntlr, char *data, int count)
 {
-    write_ignore_fail(cntlr->tcpfd, data, count);
+    write(cntlr->tcpfd, data, count);
 }
 
 static void
@@ -543,22 +543,37 @@ handle_tcp_fd_write(int fd, void *data)
     telnet_data_t *td = &cntlr->tn_data;
     int write_count;
 
-    if (buffer_cursize(&td->out_telnet_cmd) > 0) {
-	int buferr, reterr;
+    if (td->out_telnet_cmd_size > 0) {
+	write_count = write(cntlr->tcpfd,
+			    &(td->out_telnet_cmd[0]),
+			    td->out_telnet_cmd_size);
+	if (write_count == -1) {
+	    if (errno == EINTR) {
+		/* EINTR means we were interrupted, just retry by returning. */
+		goto out;
+	    }
 
-	reterr = buffer_write(cntlr->tcpfd, &td->out_telnet_cmd, &buferr);
-	if (reterr == -1) {
-	    if (buferr == EPIPE) {
+	    if (errno == EAGAIN) {
+		/* This again was due to O_NONBLOCK, just ignore it. */
+	    } else if (errno == EPIPE) {
 		goto out_fail;
 	    } else {
 		/* Some other bad error. */
 		syslog(LOG_ERR, "The tcp write for controller had error: %m");
 		goto out_fail;
 	    }
+	} else {
+	    int i, j;
+
+	    /* Copy the remaining data. */
+	    for (j=0, i=write_count; i<td->out_telnet_cmd_size; i++, j++)
+		td->out_telnet_cmd[j] = td->out_telnet_cmd[i];
+	    td->out_telnet_cmd_size -= write_count;
+	    if (td->out_telnet_cmd_size != 0)
+		/* If we have more telnet command data to send, don't
+		   send any real data. */
+		goto out;
 	}
-	if (buffer_cursize(&td->out_telnet_cmd) > 0)
-	    /* Still telnet data left, don't send regular data */
-	    goto out;
     }
 
     write_count = write(cntlr->tcpfd,
@@ -613,7 +628,6 @@ handle_accept_port_read(int fd, void *data)
     controller_info_t *cntlr;
     socklen_t         len;
     char              *err = NULL;
-    int               optval;
 
     if (num_controller_ports >= max_controller_ports) {
 	err = "Too many controller ports\n\r";
@@ -657,14 +671,6 @@ handle_accept_port_read(int fd, void *data)
 	goto errout;
     }
 
-    optval = 1;
-    if (setsockopt(cntlr->tcpfd, SOL_SOCKET, SO_KEEPALIVE, (void *)&optval,
-		   sizeof(optval)) == -1) {
-	close(cntlr->tcpfd);
-	syslog(LOG_ERR, "Could not enable SO_KEEPALIVE on the tcp port: %m");
-	goto errout;
-    }
-
     cntlr->inbuf_count = 0;
     cntlr->outbuf = NULL;
     cntlr->monitor_port_id = NULL;
@@ -700,12 +706,12 @@ errout:
 errout2:
     {
 	/* We have a problem so refuse this one. */
-	struct sockaddr_storage dummy_sockaddr;
+	struct sockaddr_in dummy_sockaddr;
 	socklen_t len = sizeof(dummy_sockaddr);
 	int new_fd = accept(fd, (struct sockaddr *) &dummy_sockaddr, &len);
 
 	if (new_fd != -1) {
-	    write_ignore_fail(new_fd, err, strlen(err));
+	    write(new_fd, err, strlen(err));
 	    close(new_fd);
 	}
     }
@@ -715,37 +721,53 @@ errout2:
 int
 controller_init(char *controller_port)
 {
-    int rv;
+    struct sockaddr_in sock;
+    int    optval = 1;
 
-    rv = scan_tcp_port(controller_port, &cntrl_ai);
-    if (rv) {
-	if (rv == EINVAL)
-	    return CONTROLLER_INVALID_TCP_SPEC;
-	else if (rv == ENOMEM)
-	    return CONTROLLER_OUT_OF_MEMORY;
-	else
-	    return -1;
+    if (scan_tcp_port(controller_port, &sock) == -1) {
+	return -1;
     }
-    
-    acceptfds = open_socket(cntrl_ai, handle_accept_port_read, NULL,
-			    &nr_acceptfds);
-    if (acceptfds == NULL) {
+
+    acceptfd = socket(PF_INET, SOCK_STREAM, 0);
+    if (acceptfd == -1) {
 	syslog(LOG_ERR, "Unable to create TCP socket: %m");
-	return CONTROLLER_CANT_OPEN_PORT;
+	exit(1);
     }
 
+    if (fcntl(acceptfd, F_SETFL, O_NONBLOCK) == -1) {
+	close(acceptfd);
+	syslog(LOG_ERR, "Could not fcntl the accept port: %m");
+	exit(1);
+    }
+
+    if (setsockopt(acceptfd,
+		   SOL_SOCKET,
+		   SO_REUSEADDR,
+		   (void *)&optval,
+		   sizeof(optval)) == -1) {
+	close(acceptfd);
+	syslog(LOG_ERR, "Unable to set reuseaddress on socket: %m");
+	exit(1);
+    }
+
+    if (bind(acceptfd, (struct sockaddr *) &sock, sizeof(sock)) == -1) {
+	close(acceptfd);
+	syslog(LOG_ERR, "Unable to bind TCP port: %m");
+	exit(1);
+    }
+
+    if (listen(acceptfd, 1) != 0) {
+	close(acceptfd);
+	syslog(LOG_ERR, "Unable to listen to TCP port: %m");
+	exit(1);
+    }
+
+    sel_set_fd_handlers(ser2net_sel,
+			acceptfd,
+			NULL,
+			handle_accept_port_read,
+			NULL,
+			NULL);
+    sel_set_fd_read_handler(ser2net_sel, acceptfd, SEL_FD_HANDLER_ENABLED);
     return 0;
-}
-
-void
-controller_shutdown(void)
-{
-    unsigned int i;
-    if (acceptfds != NULL)
-	return;
-    for (i = 0; i < nr_acceptfds; i++) {
-	sel_clear_fd_handlers(ser2net_sel, acceptfds[i]);
-	close(acceptfds[i]);
-    }
-    acceptfds = NULL;
 }

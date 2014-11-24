@@ -32,7 +32,6 @@
 #include <syslog.h>
 #include <sys/types.h>
 #include <unistd.h>
-#include <errno.h>
 
 #include "readconfig.h"
 #include "controller.h"
@@ -41,8 +40,7 @@
 #include "dataxfer.h"
 
 static char *config_file = "/etc/ser2net.conf";
-int config_port_from_cmdline = 0;
-char *config_port = NULL; /* Can be set from readconfig, too. */
+static char *config_port = NULL;
 static char *pid_file = NULL;
 static int detach = 1;
 static int debug = 0;
@@ -52,7 +50,6 @@ int uucp_locking_enabled = 1;
 int cisco_ios_baud_rates = 0;
 
 selector_t *ser2net_sel;
-char *rfc2217_signature = "ser2net";
 
 static char *help_string =
 "%s: Valid parameters are:\n"
@@ -70,54 +67,15 @@ static char *help_string =
 "  -u - Disable UUCP locking\n"
 #endif
 "  -b - Do CISCO IOS baud-rate negotiation, instead of RFC2217\n"
-"  -v - print the program's version and exit\n"
-"  -s - specify a default signature for RFC2217 protocol\n";
+"  -v - print the program's version and exit\n";
 
 void
 reread_config(void)
 {
     if (config_file) {
-	char *prev_config_port = config_port;
-	config_port = NULL;
 	syslog(LOG_INFO, "Got SIGHUP, re-reading configuration");
 	readconfig(config_file);
-	if (config_port_from_cmdline) {
-	    /* Never override the config port from the command line. */
-	    free(config_port);
-	    config_port = prev_config_port;
-	    goto config_port_unchanged;
-	}
-	if (config_port && prev_config_port
-	    && (strcmp(config_port, prev_config_port) == 0)) {
-	    free(prev_config_port);
-	    goto config_port_unchanged;
-	}
-
-	if (prev_config_port) {
-	    controller_shutdown();
-	    free(prev_config_port);
-	}
-
-	if (config_port) {
-	    int rv = controller_init(config_port);
-	    if (rv == CONTROLLER_INVALID_TCP_SPEC)
-		syslog(LOG_ERR, "Invalid control port specified: %s",
-		       config_port);
-	    else if (rv == CONTROLLER_OUT_OF_MEMORY)
-		syslog(LOG_ERR, "Out of memory opening control port: %s",
-		       config_port);
-	    else if (rv == CONTROLLER_CANT_OPEN_PORT)
-		syslog(LOG_ERR, "Can't open control port: %s",
-		       config_port);
-	    if (rv) {
-		syslog(LOG_ERR, "Control port is disabled");
-		free(config_port);
-		config_port = NULL;
-	    }
-	}
     }
- config_port_unchanged:
-    return;
 }
 
 void
@@ -142,17 +100,6 @@ make_pidfile(char *pidfile)
     }
     fprintf(fpidfile, "%d\n", getpid());
     fclose(fpidfile);
-}
-
-void
-shutdown_cleanly(void)
-{
-    shutdown_ports();
-    do {
-	if (check_ports_shutdown())
-	    exit(1);
-	sel_select_once(ser2net_sel);
-    } while(1);
 }
 
 int
@@ -217,12 +164,7 @@ main(int argc, char *argv[])
 		fprintf(stderr, "No control port specified with -p\n");
 		arg_error(argv[0]);
 	    }
-	    config_port = strdup(argv[i]);
-	    if (!config_port) {
-		fprintf(stderr, "Could not allocate memory for -p\n");
-		exit(1);
-	    }
-	    config_port_from_cmdline = 1;
+	    config_port = argv[i];
 	    break;
 	
 	case 'P':
@@ -244,22 +186,19 @@ main(int argc, char *argv[])
 	    printf("%s version %s\n", argv[0], VERSION);
 	    exit(0);
 
-	case 's':
-            i++;
-            if (i == argc) {
-	        fprintf(stderr, "No signature specified\n");
-		exit(1);
-            }
-            rfc2217_signature = argv[i];
-            break;
-
 	default:
 	    fprintf(stderr, "Invalid option: '%s'\n", argv[i]);
 	    arg_error(argv[0]);
 	}
     }
 
-    setup_signals();
+    setup_sighup();
+    if (config_port != NULL) {
+	if (controller_init(config_port) == -1) {
+	    fprintf(stderr, "Invalid control port specified with -p\n");
+	    arg_error(argv[0]);
+	}
+    }
 
     if (debug && !detach)
 	openlog("ser2net", LOG_PID | LOG_CONS | LOG_PERROR, LOG_DAEMON);
@@ -267,21 +206,6 @@ main(int argc, char *argv[])
     if (config_file) {
 	if (readconfig(config_file) == -1) {
 	    return 1;
-	}
-    }
-
-    if (config_port != NULL) {
-	int rv;
-	rv = controller_init(config_port);
-	if (rv == CONTROLLER_INVALID_TCP_SPEC) {
-	    fprintf(stderr, "Invalid control port specified: %s\n",
-		    config_port);
-	    arg_error(argv[0]);
-	}
-	if (rv == CONTROLLER_CANT_OPEN_PORT) {
-	    fprintf(stderr, "Unable to open control port, see syslog: %s\n",
-		    config_port);
-	    exit(1);
 	}
     }
 
@@ -294,7 +218,7 @@ main(int argc, char *argv[])
 	if ((pid = fork()) > 0) {
 	    exit(0);
 	} else if (pid < 0) {
-	    syslog(LOG_ERR, "Error forking first fork: %s", strerror(errno));
+	    syslog(LOG_ERR, "Error forking first fork");
 	    exit(1);
 	} else {
 	    /* setsid() is necessary if we really want to demonize */
@@ -303,17 +227,13 @@ main(int argc, char *argv[])
 	    if ((pid = fork()) > 0) {
 		exit(0);
 	    } else if (pid < 0) {
-		syslog(LOG_ERR, "Error forking second fork: %s",
-		       strerror(errno));
+		syslog(LOG_ERR, "Error forking second fork");
 		exit(1);
 	    }
 	}
 
 	/* Close all my standard I/O. */
-	if (chdir("/") < 0) {
-	    syslog(LOG_ERR, "unable to chdir to '/': %s", strerror(errno));
-	    exit(1);
-	}
+	chdir("/");
 	close(0);
 	close(1);
 	close(2);
@@ -325,8 +245,7 @@ main(int argc, char *argv[])
     /* Ignore SIGPIPEs so they don't kill us. */
     signal(SIGPIPE, SIG_IGN);
 
-    set_signal_handler(SIGHUP, reread_config);
-    set_signal_handler(SIGINT, shutdown_cleanly);
+    set_sighup_handler(reread_config);
 
     sel_select_loop(ser2net_sel);
 

@@ -19,17 +19,13 @@
 
 /* This file holds basic utilities used by the ser2net program. */
 
-#include <stdlib.h>
 #include <string.h>
+#include <netdb.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
 #include <arpa/inet.h>
-#include <errno.h>
-#include <unistd.h>
-#include <fcntl.h>
 
 #include "utils.h"
-#include "selector.h"
-
-extern selector_t *ser2net_sel;
 
 /* Scan for a positive integer, and return it.  Return -1 if the
    integer was invalid. */
@@ -62,196 +58,51 @@ scan_int(char *str)
     return rv;
 }
 
-/* Scan for a TCP port in the form "[hostname,]x", where the optional
-   first part is a resolvable hostname, an IPv4 octet, or an IPv6 address.
-   In the absence of a host specification, a wildcard address is used.
-   The mandatory second part is the port number or a service name. */
+/* Scan for a TCP port in the form "[x.x.x.x,]x" where the first part is
+   the IP address (options, defaults to INADDR_ANY) and the second part
+   is the port number (required). */
 int
-scan_tcp_port(char *str, struct addrinfo **rai)
+scan_tcp_port(char *str, struct sockaddr_in *addr)
 {
-    char *strtok_data, *strtok_buffer;
+    char *strtok_data;
     char *ip;
     char *port;
-    struct addrinfo hints, *ai;
+    int  port_num;
 
-    strtok_buffer = strdup(str);
-    if (!strtok_buffer)
-	return ENOMEM;
-
-    ip = strtok_r(strtok_buffer, ",", &strtok_data);
+    ip = strtok_r(str, ",", &strtok_data);
     port = strtok_r(NULL, "", &strtok_data);
     if (port == NULL) {
 	port = ip;
 	ip = NULL;
-    }
+	addr->sin_addr.s_addr = INADDR_ANY;
+	port_num = scan_int(port);
+	if (port_num == -1) {
+	    return -1;
+	}
+	addr->sin_port = htons(port_num);
+    } else {
+	/* Both an IP and port were specified. */
+	addr->sin_addr.s_addr = inet_addr(ip);
+	if (addr->sin_addr.s_addr == INADDR_NONE) {
+	    struct hostent *hp;
 
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_flags = AI_PASSIVE;
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    if (getaddrinfo(ip, port, &hints, &ai)) {
-	free(strtok_buffer);
-	return EINVAL;
-    }
+	    hp = gethostbyname(ip);
+	    if (hp == NULL) {
+		return -1;
+	    }
+	    if (hp->h_addrtype != AF_INET) {
+		return -1;
+	    }
+	    memcpy(&addr->sin_addr, hp->h_addr_list[0], hp->h_length);
+	}
 
-    free(strtok_buffer);
-    if (*rai)
-	freeaddrinfo(*rai);
-    *rai = ai;
+	port_num = scan_int(port);
+	if (port_num == -1) {
+	    return -1;
+	}
+	addr->sin_port = htons(port_num);
+    }
+    addr->sin_family = AF_INET;
+
     return 0;
-}
-
-void
-check_ipv6_only(int family, struct sockaddr *addr, int fd)
-{
-    if ((family == AF_INET6)
-	&& IN6_IS_ADDR_UNSPECIFIED(&(((struct sockaddr_in6 *) addr)->sin6_addr)))
-    {
-	int null = 0;
-
-	setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &null, sizeof(null));
-    }
-}
-
-int *
-open_socket(struct addrinfo *ai, void (*readhndlr)(int, void *), void *data,
-	    unsigned int *nr_fds)
-{
-    struct addrinfo *rp;
-    int optval = 1;
-    int family = AF_INET6; /* Try IPV6 first, then IPV4. */
-    int *fds;
-    unsigned int curr_fd = 0;
-    unsigned int max_fds = 0;
-
-    for (rp = ai; rp != NULL; rp = rp->ai_next)
-	max_fds++;
-
-    fds = malloc(sizeof(int) * max_fds);
-    if (!fds)
-	return NULL;
-
-  restart:
-    for (rp = ai; rp != NULL; rp = rp->ai_next) {
-	if (family != rp->ai_family)
-	    continue;
-
-	fds[curr_fd] = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-	if (fds[curr_fd] == -1)
-	    continue;
-
-	if (fcntl(fds[curr_fd], F_SETFL, O_NONBLOCK) == -1)
-	    goto next;
-
-	if (setsockopt(fds[curr_fd], SOL_SOCKET, SO_REUSEADDR,
-		       (void *)&optval, sizeof(optval)) == -1)
-	    goto next;
-
-	check_ipv6_only(rp->ai_family, rp->ai_addr, fds[curr_fd]);
-
-	if (bind(fds[curr_fd], rp->ai_addr, rp->ai_addrlen) != 0)
-	    goto next;
-
-	if (listen(fds[curr_fd], 1) != 0)
-	    goto next;
-
-	sel_set_fd_handlers(ser2net_sel, fds[curr_fd], data,
-			    readhndlr, NULL, NULL);
-	sel_set_fd_read_handler(ser2net_sel, fds[curr_fd],
-				SEL_FD_HANDLER_ENABLED);
-	curr_fd++;
-	continue;
-
-      next:
-	close(fds[curr_fd]);
-    }
-    if (family == AF_INET6) {
-	family = AF_INET;
-	goto restart;
-    }
-
-    if (curr_fd == 0) {
-	free(fds);
-	fds = NULL;
-    }
-    *nr_fds = curr_fd;
-    return fds;
-}
-
-int *
-connect_socket(struct addrinfo *ai, unsigned int *nr_fds)
-{
-    struct addrinfo *rp;
-    int family = AF_INET6; /* Try IPV6 first, then IPV4. */
-    int *fds;
-    unsigned int curr_fd = 0;
-    unsigned int max_fds = 0;
-
-    for (rp = ai; rp != NULL; rp = rp->ai_next)
-	max_fds++;
-
-    fds = malloc(sizeof(int) * max_fds);
-    if (!fds)
-	return NULL;
-
-  restart:
-    for (rp = ai; rp != NULL; rp = rp->ai_next) {
-	if (family != rp->ai_family)
-	    continue;
-
-	fds[curr_fd] = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-	if (fds[curr_fd] == -1)
-	    continue;
-
-	check_ipv6_only(rp->ai_family, rp->ai_addr, fds[curr_fd]);
-
-	if (connect(fds[curr_fd], rp->ai_addr, rp->ai_addrlen) != 0)
-	    goto next;
-
-	curr_fd++;
-	continue;
-
-      next:
-	close(fds[curr_fd]);
-    }
-    if (family == AF_INET6) {
-	family = AF_INET;
-	goto restart;
-    }
-
-    if (curr_fd == 0) {
-	free(fds);
-	fds = NULL;
-    }
-    *nr_fds = curr_fd;
-    return fds;
-}
-
-int
-write_full(int fd, char *data, size_t count)
-{
-    size_t written;
-
- restart:
-    while ((written = write(fd, data, count)) > 0) {
-	data += written;
-	count -= written;
-    }
-    if (written < 0) {
-	if (errno == EAGAIN)
-	    goto restart;
-	return -1;
-    }
-    return 0;
-}
-
-void
-write_ignore_fail(int fd, char *data, size_t count)
-{
-    ssize_t written;
-
-    while ((written = write(fd, data, count)) > 0) {
-	data += written;
-	count -= written;
-    }
 }

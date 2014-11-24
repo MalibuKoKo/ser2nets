@@ -71,9 +71,6 @@ addresses on the machine.
 If the port number is zero, that means that standard in/out will be
 used for the only input/output, and only one port should be specified
 in the config.  This way, it can be used from inetd.
-.TP
-.I \-s signature
-Specifies the default RFC2217 signature.
 
 .SH CONTROL PORT
 The control port provides a simple interface for controlling the ports and 
@@ -177,23 +174,7 @@ BANNER:<banner name>:<banner text>
 .PP
 or
 .IP
-SIGNATURE:<signature name>:<signature text>
-.PP
-or
-.IP
-OPENSTR:<openstr name>:<openstr text>
-.PP
-or
-.IP
-CLOSESTR:<closestr name>:<closestr text>
-.PP
-or
-.IP
 TRACEFILE:<tracefile name>:<tracefile>
-.PP
-or
-.IP
-CONTROLPORT:<port spec>
 .PP
 
 .SS FIELDS
@@ -201,10 +182,9 @@ CONTROLPORT:<port spec>
 .I "TCP port"
 Name  or number of the TCP/IP port to accept connections from for this
 device.  A port number may be of the form [host,]port, such as 127.0.0.1,2000
-or localhost,2000, or ::,2000.  If this is specified, it will only bind to the
+or localhost,2000.  If this is specified, it will only bind to the
 IP address specified for the port.  Otherwise, it will bind to all the
-ports on the machine.  You can specify an IPV6 address in the port, any
-colon before the comma is ignored for parsing fields.
+ports on the machine.
 .TP
 .I state
 Either 
@@ -231,7 +211,7 @@ telnet parameters.  This is most useful for using telnet.
 .TP
 .I timeout
 The time (in seconds) before the port will be disconnected if there is
-no activity on it.  A zero value disables this function.
+no activity on it.  A zero value disables this funciton.
 .TP
 .I device
 The  name  of  the  device  to connect to. This must be in the form of
@@ -258,18 +238,12 @@ ignores (- checks) the modem control lines (DCD, DTR, etc.)
 lowers (- does not lower) the modem control lines (DCD, DTR, etc.) when
 the connection closes.
 .I NOBREAK
-disables automatic clearing of the break setting of the port.
+Disables automatic clearing of the break setting of the port.
 .I remctl
 allows remote control of the serial port parameters via RFC 2217.  See
 the README for more info.
 .I <banner name>
 displays the given banner when a user connects to the port.
-.I <signature name>
-sends RFC2217 signature on clients request.
-.I <openstr name>
-Send the given string to the device when the port is opened.
-.I <closestr name>
-Send the given string to the device when the port is closed.
 
 .I tr=<filename>
 When the port is opened, open the given tracefile and store all data read
@@ -286,34 +260,13 @@ trace both read and written data to the same file.  Note that this is
 independent of tr and tw, so you may be tracing read, write, and both
 to different files.
 
-.I [-]hexdump
-turns on (- turns off) hexdump output to all trace files.  Each line in the
-trace file will be 8 (or less) bytes in canonical hex+ASCII format.  This is
-useful for debugging a binary protocol.
-
-.I [-]timestamp
-adds (- removes) a timestamp to all of the trace files. A timestamp
-is prepended to each line if hexdump is active for the trace file.  A
-timestamped line is also recorded in the trace file when a remote client
-connects or disconnects from the port.
-
-.I [-][tr-|tw-|tb-]hexdump
-turns on (- turns off) hexdump output for only one trace file.
-May be combined with [-]hexdump.  Order is important.
-
-.I [-][tr-|tw-|tb-]timestamp
-adds (- removes) a timestamp to only one the trace files
-May be combined with [-]timestamp.  Order is important.
-
-
 .TP
 .I "banner name"
 A name for the banner; this may be used in the options of a port.
 .TP
 .I "banner text"
 The text to display as the banner.  It takes escape sequences for
-substituting strings, see "FILENAME, BANNER, AND STRING FORMATTING"
-for details.
+substituting strings, see "FILENAME AND BANNER FORMATTING" for details.
 
 .TP
 .I "tracefile name"
@@ -322,23 +275,16 @@ of a port.
 .TP
 .I "tracefile"
 The file to send the trace into.  Note that this takes escape
-sequences for substituting strings, see "FILENAME, BANNER, AND STRING
+sequences for substituting strings, see "FILENAME AND BANNER
 FORMATTING" for details.  Note that when using the time escape
 sequences, the time is read once at port startup, so if you use both
 tw and tr they will have the same date and time.
-.TP
-.I "port spec"
-The control port specification as defined by the [\-p] option on the
-command line.  This lets the control port be specified in the configuration
-file.  The command line will override this, and only the first port
-specified is used.
 
 .PP
 Blank lines and lines starting with `#' are ignored.
 
-.SH FILENAME, BANNER, AND STRING FORMATTING
-Filenames, banners, and open/close string may contain normal "C"
-escape sequences and a large number of other escape sequences, too:
+.SH FILENAME AND BANNER FORMATTING
+Filenames and banners may contain normal "C" escape sequences:
 
 .RS 2
 \ea - bell
@@ -349,7 +295,7 @@ escape sequences and a large number of other escape sequences, too:
 .br
 \en - newline
 .br
-\er - carriage return
+\er - carraige return
 .br
 \et - tab
 .br
@@ -366,13 +312,17 @@ escape sequences and a large number of other escape sequences, too:
 \ennn - octal value for nnn
 .br
 \exXX - hex value for XX
-.br
-\ed - The device name (/dev/ttyS0, etc.)
-.br
-\ep - TCP port number
-.br
-\eB - The serial port parameters (eg 9600N81)
-.br
+.RE
+
+They may also contain, \ed for the device name and \ep for the TCP
+port number.
+
+A banner may contain \es for the serial port parameters (eg 9600N81)
+of the given connection.
+
+A filename may also contain the following sequences:
+
+.RS 2
 \eY -> year
 .br
 \ey -> day of the year (days since Jan 1)
@@ -401,17 +351,12 @@ escape sequences and a large number of other escape sequences, too:
 .br
 \ei -> minute
 .br
-\eS -> second
+\es -> second
 .br
 \eq -> am/pm
 .br
 \eP -> AM/PM
 .RE
-
-In addition, for backwards compatibility because filenames and banners
-used to have different formatting, \es is the serial port parameters
-if in a banner and seconds if in a filename.  Use of this is
-discouraged as it may change in the future.
 
 These sequences may be used to make the filename unique per open and
 identify which port/device the filename was for.  Note that in

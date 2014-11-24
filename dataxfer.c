@@ -21,8 +21,10 @@
    ports and the TCP ports. */
 
 #include <termios.h>
+#include <sys/types.h>
 #include <sys/ioctl.h>
 #include <sys/time.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <arpa/inet.h>
 #include <stdlib.h>
@@ -44,11 +46,9 @@
 #include "utils.h"
 #include "telnet.h"
 #include "http.h"
+#include "list.h"
 
 extern selector_t *ser2net_sel;
-
-#define SERIAL "term"
-#define NET    "tcp "
 
 /** BASED ON sshd.c FROM openssh.com */
 #ifdef HAVE_TCPD_H
@@ -58,6 +58,9 @@ static char *progname = "ser2net";
 
 #ifdef USE_UUCP_LOCKING
 static char *uucp_lck_dir = "/var/lock";
+#ifndef HAVE_TCPD_H
+static char *progname = "ser2net";
+#endif
 #endif /* USE_UUCP_LOCKING */
 
 
@@ -68,10 +71,7 @@ static char *uucp_lck_dir = "/var/lock";
 					     input side. */
 #define PORT_WAITING_OUTPUT_CLEAR	2 /* Waiting for output to clear
 					     so I can send data. */
-#define PORT_CLOSING			3 /* Waiting for output close
-					     string to be sent. */
-char *state_str[] = { "unconnected", "waiting input", "waiting output",
-		      "closing" };
+char *state_str[] = { "unconnected", "waiting input", "waiting output" };
 
 #define PORT_DISABLED		0 /* The port is not open. */
 #define PORT_RAW		1 /* Port will not do telnet negotiation. */
@@ -82,72 +82,53 @@ char *state_str[] = { "unconnected", "waiting input", "waiting output",
 #define PORT_HTTP		5 /* Port will process HTTP request. */
 char *enabled_str[] = { "off", "raw", "rawlp", "telnet", "rraw", "http" };
 
-#define PORT_BUFSIZE	64
+#define PORT_BUFSIZE	1024
 
-#define PORT_IS_FREE(port) (NULL == port->tcp_list)
-
-#define DEBUG 1
-#if DEBUG
+#define PORT_IS_FREE(port) list_is_empty(port->tcp_list)
 #define D(...) printf(__VA_ARGS__);
-#define tcp_print_list(...) tcp_print_list_impl(__VA_ARGS__);
-#else
-#define D(...)
-#define tcp_print_list
-#endif
 
 struct port_info;
 
-typedef struct tcp_info_s
-{
+typedef struct tcp_info_s {
     struct port_info   *port;
-
-    int            timeout;		/* The number of seconds to
-					   wait without any I/O before
-					   we shut the port down. */
-
-    int            timeout_left;	/* The amount of time left (in
-					   seconds) before the timeout
-					   goes off. */
-
-    sel_timer_t *timer;			/* Used to timeout when the no
-					   I/O has been seen for a
-					   certain period of time. */
-
-    int            tcpfd;		/* When connected, the file
-                                           descriptor for the TCP
-                                           port used for I/O. */
-    struct sockaddr_storage remote;	/* The socket address of who
-					   is connected to this port. */
-    unsigned int tcp_bytes_received;    /* Number of bytes read from the
-					   TCP port. */
-    unsigned int tcp_bytes_sent;        /* Number of bytes written to the
-					   TCP port. */
-    struct sbuf *banner;                /* Outgoing banner */
-
+    int                tcpfd;               /* When connected, the file
+                                               descriptor for the TCP
+                                               port used for I/O. */
+    struct sockaddr_in remote;              /* The socket address of who
+                                               is connected to this port. */
+    unsigned int   tcp_bytes_received;      /* Number of bytes read from the
+                                               TCP port. */
+    unsigned int   tcp_bytes_sent;          /* Number of bytes written to the
+                                               TCP port. */
     /* Information use when transferring information from the terminal
-       device to the TCP port. */
-    int            dev_to_tcp_state;		/* State of transferring
-						   data from the device to
+           device to the TCP port. */
+    int            dev_to_tcp_state;            /* State of transferring
+                                                   data from the device to
                                                    the TCP port. */
-    struct sbuf    dev_to_tcp;			/* Buffer struct for
-						   device to TCP
-						   transfers. */
+    unsigned char  dev_to_tcp_buf[PORT_BUFSIZE]; /* Buffer used for
+                                                    device to TCP
+                                                    transfers. */
+    int            dev_to_tcp_buf_start;        /* The first byte in
+                                                   the buffer that is
+                                                   ready to send. */
+    int            dev_to_tcp_buf_count;        /* The number of bytes
+                                                   in the buffer to
+                                                   send. */
+    int            timeout;              /* The number of seconds to
+                                            wait without any I/O before
+                                            we shut the port down. */
 
+    int            timeout_left;        /* The amount of time left (in
+                                            seconds) before the timeout
+                                            goes off. */
+    sel_timer_t    *timer;                 /* Used to timeout when the no
+                                           I/O has been seen for a
+                                           certain period of time. */
     /* Data for the telnet processing */
     telnet_data_t  tn_data;
     /* Data for the http processing */
     http_data_t    ht_data;
-
-    struct tcp_info_s *prev;
-    struct tcp_info_s *next;
 } tcp_info_t;
-
-typedef struct trace_s
-{
-    int            hexdump;     /* output each block as a hexdump */
-    int            timestamp;   /* preceed each line with a timestamp */
-    int            file;        /* open file.  -1 if not used */
-} trace_t;
 
 typedef struct port_info
 {
@@ -172,14 +153,13 @@ typedef struct port_info
 
     /* Information about the TCP port. */
     char               *portname;       /* The name given for the port. */
-    int                is_stdio;        /* Do stdio on the port? */
-    int                is_client;       /* Is client socket? */
-    struct addrinfo    *ai;		/* The address list for the portname. */
-    int            *acceptfds;		/* The file descriptor used to
+    struct sockaddr_in tcpport;		/* The TCP port to listen on
+					   for connections to this
+					   terminal device. */
+    int            acceptfd;		/* The file descriptor used to
 					   accept connections on the
 					   TCP port. */
-    unsigned int   nr_acceptfds;
-    struct sockaddr_storage remote;	/* The socket address of who
+    struct sockaddr_in remote;		/* The socket address of who
 					   is connected to this port. */
     unsigned int tcp_bytes_received;    /* Number of bytes read from the
 					   TCP port. */
@@ -196,39 +176,40 @@ typedef struct port_info
     unsigned int dev_bytes_sent;        /* Number of bytes written to the
 					   device. */
 
+
     /* Information use when transferring information from the TCP port
        to the terminal device. */
     int            tcp_to_dev_state;		/* State of transferring
 						   data from the TCP port
                                                    to the device. */
-    struct sbuf    tcp_to_dev;			/* Buffer struct for
-						   TCP to device
-						   transfers. */
-    unsigned char  tcp_to_devbuf[PORT_BUFSIZE]; /* Buffer used for
-						   TCP to device
-						   transfers. */
+    unsigned char  tcp_to_dev_buf[PORT_BUFSIZE]; /* Buffer used for
+                                                    TCP to device
+                                                    transfers. */
+    int            tcp_to_dev_buf_start;	/* The first byte in
+						   the buffer that is
+						   ready to send. */
+    int            tcp_to_dev_buf_count;	/* The number of bytes
+                                                   in the buffer to
+                                                   send. */
     struct controller_info *tcp_monitor; /* If non-null, send any input
 					    received from the TCP port
 					    to this controller port. */
-    struct sbuf *devstr;		 /* Outgoing string */
 
-    char *closestr;			/* Since the close string is
-					   processed at shutdown, the
-					   conf may have been redone and
-					   the data freed.  So keep a
-					   copy here. */
 
     /* Information use when transferring information from the terminal
        device to the TCP port. */
     int            dev_to_tcp_state;		/* State of transferring
 						   data from the device to
                                                    the TCP port. */
-    struct sbuf    dev_to_tcp;			/* Buffer struct for
-						   device to TCP
-						   transfers. */
-    unsigned char  dev_to_tcpbuf[PORT_BUFSIZE]; /* Buffer used for
-						   device to TCP
-						   transfers. */
+    unsigned char  dev_to_tcp_buf[PORT_BUFSIZE]; /* Buffer used for
+                                                    device to TCP
+                                                    transfers. */
+    int            dev_to_tcp_buf_start;	/* The first byte in
+						   the buffer that is
+						   ready to send. */
+    int            dev_to_tcp_buf_count;	/* The number of bytes
+                                                   in the buffer to
+                                                   send. */
     struct controller_info *dev_monitor; /* If non-null, send any input
 					    received from the device
 					    to this controller port. */
@@ -257,14 +238,14 @@ typedef struct port_info
     unsigned char modemstate_mask;
     unsigned char last_modemstate;
 
-    /* Read and write trace information */
-    trace_t wt;
-    trace_t rt;
-    trace_t bt;
+    /* Read and write trace files, -1 if not used. */
+    int wt_file;
+    int rt_file;
+    int bt_file;
 
     dev_info_t dinfo; /* device configuration information */
 
-    tcp_info_t *tcp_list;
+    list_node_t *tcp_list;
 
     /* Timer for restarting port when startup_port failed */
     int restart_timeout;
@@ -275,8 +256,7 @@ typedef struct port_info
 port_info_t *ports = NULL; /* Linked list of ports. */
 
 static void shutdown_port(port_info_t *port, tcp_info_t *tcp, char *reason);
-static void finish_shutdown_port(port_info_t *port);
-static char* startup_port(port_info_t *port);
+static char * startup_port(port_info_t *port);
 
 /* The init sequence we use. */
 static unsigned char telnet_init_seq[] = {
@@ -353,39 +333,34 @@ static int
 uucp_mk_lock(char *devname)
 {
     struct stat stt;
-    int pid = -1;
+    int pid=-1;
 
-    if (!uucp_locking_enabled)
-	return 0;
+    if (!uucp_locking_enabled) return 0;
 
-    if (stat(uucp_lck_dir, &stt) == 0) { /* is lock file directory present? */
-	char *lck_file;
-	union {
-	    uint32_t ival;
-	    char     str[64];
-	} buf;
+    if( stat(uucp_lck_dir, &stt) == 0 ) { /* is lock file directory present? */
+	char *lck_file, buf[64];
 	int fd;
 
 	lck_file = malloc(uucp_fname_lock_size(devname));
-	if (lck_file == NULL)
+	if (lck_file == NULL) {
 	    return -1;
-
+	}
 	uucp_fname_lock(lck_file, devname);
 
 	pid = 0;
-	if ((fd = open(lck_file, O_RDONLY)) >= 0) {
+	if( (fd = open(lck_file, O_RDONLY)) >= 0 ) {
 	    int n;
 
-    	    n = read(fd, &buf, sizeof(buf));
+    	    n = read(fd, buf, sizeof(buf));
 	    close(fd);
 	    if( n == 4 ) 		/* Kermit-style lockfile. */
-		pid = buf.ival;
-	    else if (n > 0) {		/* Ascii lockfile. */
-		buf.str[n] = 0;
-		sscanf(buf.str, "%d", &pid);
+		pid = *(int *)buf;
+	    else if( n > 0 ) {		/* Ascii lockfile. */
+		buf[n] = 0;
+		sscanf(buf, "%d", &pid);
 	    }
 
-	    if (pid > 0 && kill((pid_t)pid, 0) < 0 && errno == ESRCH) {
+	    if( pid > 0 && kill((pid_t)pid, 0) < 0 && errno == ESRCH ) {
 		/* death lockfile - remove it */
 		unlink(lck_file);
 		sleep(1);
@@ -395,24 +370,19 @@ uucp_mk_lock(char *devname)
 
 	}
 
-	if (pid == 0) {
+	if( pid == 0 ) {
 	    int mask;
-	    size_t rv;
 
 	    mask = umask(022);
 	    fd = open(lck_file, O_WRONLY | O_CREAT | O_EXCL, 0666);
 	    umask(mask);
-	    if (fd >= 0) {
-		snprintf(buf.str, sizeof(buf), "%10ld\n",
-			 (long)getpid());
-		rv = write_full(fd, buf.str, strlen(buf.str));
+	    if( fd >= 0 ) {
+		snprintf( buf, sizeof(buf), "%10ld\t%s\n",
+					     (long)getpid(), progname );
+		write( fd, buf, strlen(buf) );
 		close(fd);
-		if (rv < 0) {
-		    pid = -1;
-		    unlink(lck_file);
-		}
 	    } else {
-		pid = -1;
+		pid = 1;
 	    }
 	}
 
@@ -428,56 +398,59 @@ init_port_data(port_info_t *port)
 {
     port->enabled = PORT_DISABLED;
     port->portname = NULL;
-    port->acceptfds = NULL;
+    memset(&(port->tcpport), 0, sizeof(port->tcpport));
+    port->acceptfd = -1;
     port->timeout = 0;
     port->next = NULL;
     port->new_config = NULL;
     port->tcp_monitor = NULL;
-    port->is_stdio = 0;
-    port->is_client = 0;
-    port->ai = NULL;
     
     port->devname = NULL;
-    port->devfd = -1;
+    port->devfd = 0;
     memset(&(port->remote), 0, sizeof(port->remote));
     memset(&(port->dinfo.termctl), 0, sizeof(port->dinfo.termctl));
     port->tcp_to_dev_state = PORT_UNCONNECTED;
-    buffer_init(&port->tcp_to_dev, port->tcp_to_devbuf,
-		sizeof(port->tcp_to_devbuf));
+    port->tcp_to_dev_buf_start = 0;
+    port->tcp_to_dev_buf_count = 0;
     port->tcp_bytes_received = 0;
     port->tcp_bytes_sent = 0;
     port->dev_to_tcp_state = PORT_UNCONNECTED;
-    buffer_init(&port->dev_to_tcp, port->dev_to_tcpbuf,
-		sizeof(port->dev_to_tcpbuf));
+    port->dev_to_tcp_buf_start = 0;
+    port->dev_to_tcp_buf_count = 0;
     port->dev_bytes_received = 0;
     port->dev_bytes_sent = 0;
-    port->devstr = NULL;
-    port->closestr = NULL;
     port->is_2217 = 0;
-    port->dev_monitor = NULL;
     port->break_set = 0;
     port->dinfo.disablebreak = 0;
-    port->wt.file = -1;
-    port->wt.timestamp = 0;
-    port->wt.hexdump = 0;
-    port->rt.file = -1;
-    port->rt.timestamp = 0;
-    port->rt.hexdump = 0;
-    port->bt.file = -1;
-    port->bt.timestamp = 0;
-    port->bt.hexdump = 0;
+    port->wt_file = -1;
+    port->rt_file = -1;
+    port->bt_file = -1;
 
     port->restart_timeout = 0;
+    port->tcp_list = NULL;
+}
+
+void
+delete_tcp_to_dev_char(port_info_t *port, int pos)
+{
+    int j;
+
+    for (j=pos; j<port->tcp_to_dev_buf_count-1; j++) {
+	port->tcp_to_dev_buf[j] = port->tcp_to_dev_buf[j+1];
+    }
+    port->tcp_to_dev_buf_count--;
 }
 
 static void
 reset_timer(port_info_t *port)
 {
-    tcp_info_t *tcp = port->tcp_list;
-    while (tcp) {
+    list_node_t *node = port->tcp_list;
+    tcp_info_t *tcp;
+    while (node) {
+	tcp = (tcp_info_t *) node->data;
 	tcp->timeout = port->timeout;
 	tcp->timeout_left = tcp->timeout;
-	tcp = tcp->next;
+	node = node->next;
     }
 }
 
@@ -496,87 +469,14 @@ tick_timer(sel_timer_t *timer)
     sel_start_timer(timer, &then);
 }
 
-static int
-timestamp(trace_t *tr, char *buf, int size)
-{
-    time_t result;
-    if(!tr->timestamp)
-        return 0;
-    result = time(NULL);
-    return strftime(buf, size, "%Y/%m/%d %H:%M:%S ", localtime(&result));
-}
-
-static int
-trace_write_end(char *out, int size, unsigned char *start, int col)
-{
-    int pos=0, w;
-
-    strncat(out, " |", size-pos);
-    pos += 2;
-    for(w = 0; w < col; w++) {
-        pos += snprintf(out + pos, size - pos, "%c",
-			isprint(start[w]) ? start[w] : '.');
-    }
-    strncat(out+pos, "|\n", size-pos);
-    pos += 2;
-    return pos;
-}
-
-int
-trace_write(port_info_t *port, trace_t *tr, unsigned char *buf,
-	    unsigned int buf_len, char *prefix)
-{
-    int rv=0, w, col=0, pos, file = tr->file;
-    unsigned int q;
-    static char out[1024];
-    unsigned char *start;
-
-    if( buf_len == 0 ) 
-        return 0;
-
-    if(!tr->hexdump)
-        return write(file, buf, buf_len);
-
-    pos = timestamp(tr, out, sizeof(out));    
-    pos += snprintf(out + pos, sizeof(out) - pos, "%s ", prefix);
-        
-    start = buf;
-    for (q = 0; q < buf_len; q++) {
-        pos += snprintf(out + pos, sizeof(out) - pos, "%02x ", buf[q]);
-        col++;
-        if (col >= 8) {
-            pos += trace_write_end(out + pos, sizeof(out) - pos, start, col);
-            rv = write(file, out, strlen(out));
-            if (rv < 0)
-                return rv;           
-            pos = timestamp(tr, out, sizeof(out));    
-            pos += snprintf(out + pos, sizeof(out) - pos, "%s ", prefix);
-            col = 0;
-            start = buf + q + 1;
-        }
-    }
-    if ( col > 0 ) {
-        for (w = 8; w > col; w--) {
-            strncat(out + pos, "   ", sizeof(out) - pos);
-            pos += 3;
-        }
-        pos += trace_write_end(out + pos, sizeof(out) - pos, start, col);
-        rv = write(file, out, strlen(out));
-        if(rv < 0)
-            return rv;
-    }
-    return buf_len;
-}
-
 static void
-do_trace(port_info_t *port, trace_t *tr, unsigned char *buf,
-	 unsigned int buf_len, char *prefix)
+do_trace(port_info_t *port, int file, unsigned char *buf, unsigned int buf_len)
 {
     int rv;
 
     while (buf_len > 0) {
     retry_write:
-	rv = trace_write(port, tr, buf, buf_len, prefix);
+	rv = write(file, buf, buf_len);
 	if (rv == -1) {
 	    char errbuf[128];
 	    int err = errno;
@@ -593,8 +493,13 @@ do_trace(port_info_t *port, trace_t *tr, unsigned char *buf,
 		syslog(LOG_ERR, "Unable to write to trace file on port %s: %s",
 		       port->portname, errbuf);
 	    
-	    close(tr->file);
-	    tr->file = -1;
+	    if (file == port->rt_file)
+		port->rt_file = -1;
+	    if (file == port->wt_file)
+		port->wt_file = -1;
+	    if (file == port->bt_file)
+		port->bt_file = -1;
+	    close(file);
 	    return;
 	}
 
@@ -605,65 +510,45 @@ do_trace(port_info_t *port, trace_t *tr, unsigned char *buf,
 }
 
 static void
-header_trace(port_info_t *port)
+tcp_timeout(selector_t  *sel, sel_timer_t *timer, void *data)
 {
-    static char buf[1024];
-    static trace_t tr = { 1, 1, -1 };
-    int len = 0, doneR=-1, doneW=-1;
-    char portstr[NI_MAXSERV];
+    tcp_info_t *tcp = (tcp_info_t *) data;
+    port_info_t *port = tcp->port;
+    unsigned char modemstate;
+    int val;
 
-    len += timestamp(&tr, buf, sizeof(buf));
-    len += snprintf(buf + len, sizeof(buf) - len, "OPEN (");
-    getnameinfo((struct sockaddr *) &(port->remote), sizeof(port->remote),
-		buf + len, sizeof(buf) - len,
-		portstr, sizeof(portstr), NI_NUMERICHOST);
-    len += strlen(buf + len);
-    if ((sizeof(buf) - len) > 2) {
-	buf[len] = ':';
-	len++;
+    if (tcp->timeout) {
+	tcp->timeout_left--;
+	//D("timeout: %d, left: %d\n", tcp->timeout, tcp->timeout_left);
+	if (tcp->timeout_left < 0) {
+	    shutdown_port(port, tcp, "timeout");
+	    return;
+	}
     }
-    strncpy(buf + len, portstr, sizeof(buf) - len);
-    len += strlen(buf + len);
-    len += snprintf(buf + len, sizeof(buf) - len, ")\n");
 
-    if (port->rt.file != -1 && port->rt.timestamp) {
-        write_ignore_fail(port->rt.file, buf, len);
-        doneR = port->rt.file;
-    }
-    /* don't output to wt.file if it's the same as rt.file */
-    if (port->wt.file != doneR && port->wt.timestamp) {
-        write_ignore_fail(port->wt.file, buf, len);
-        doneW = port->wt.file;
-    }
-    /* don't output to bt.file if it's the same as rt.file or wt.file */
-    if (port->bt.file != doneR && port->bt.file != doneW 
-                && port->bt.timestamp)
-        write_ignore_fail(port->bt.file, buf, len);    
-}
+    if (port->is_2217 && (ioctl(port->devfd, TIOCMGET, &val) != -1)) {
+	modemstate = 0;
+	if (val & TIOCM_CD)
+	    modemstate |= 0x80;
+	if (val & TIOCM_RI)
+	    modemstate |= 0x40;
+	if (val & TIOCM_DSR)
+	    modemstate |= 0x20;
+	if (val & TIOCM_CTS)
+	    modemstate |= 0x10;
 
-static void
-footer_trace(port_info_t *port, char *reason)
-{
-    static char buf[1024];
-    static trace_t tr = { 1, 1, -1 };
-    int len=0, doneR=-1, doneW=-1;
-
-    len += timestamp(&tr, buf, sizeof(buf));
-    len += snprintf(buf + len, sizeof(buf), "CLOSE (%s)\n", reason);
-
-    if (port->rt.file != -1 && port->rt.timestamp) {
-        write_ignore_fail(port->rt.file, buf, len);
-        doneR = port->rt.file;
+	modemstate &= port->modemstate_mask;
+	if (modemstate != port->last_modemstate) {
+	    unsigned char data[3];
+	    data[0] = TN_OPT_COM_PORT;
+	    data[1] = 107; /* Notify modemstate */
+	    data[2] = modemstate;
+	    port->last_modemstate = modemstate;
+	    telnet_send_option(&tcp->tn_data, data, 3);
+	}
     }
-    /* don't output to wt.file if it's the same as rt.file */
-    if (port->wt.file != doneR && port->wt.timestamp) {
-        write_ignore_fail(port->wt.file, buf, len);
-        doneW = port->wt.file;
-    }
-    /* don't output to bt.file if it's the same as rt.file or wt.file */
-    if (port->bt.file != doneR && port->bt.file != doneW 
-                && port->bt.timestamp)
-        write_ignore_fail(port->bt.file, buf, len);
+
+    tick_timer(tcp->timer);
 }
 
 static void
@@ -672,62 +557,44 @@ tcp_reset_timer(tcp_info_t *tcp)
     tcp->timeout_left = tcp->timeout;
 }
 
-void got_timeout(selector_t  *sel, sel_timer_t *timer, void *data);
-
 static tcp_info_t *
 tcp_new(int tcpfd)
 {
     tcp_info_t *tcp = (tcp_info_t *) malloc(sizeof(tcp_info_t));
     memset(tcp, 0, sizeof(tcp_info_t));
     tcp->tcpfd = tcpfd;
-    sel_alloc_timer(ser2net_sel, got_timeout, tcp, &tcp->timer);
+    sel_alloc_timer(ser2net_sel, tcp_timeout, tcp, &tcp->timer);
     return tcp;
 }
 
-#if DEBUG
+#define tcp_print_list tcp_print_list_impl
+//#define tcp_print_list
+
 static void
-tcp_print_list_impl(tcp_info_t *tcp_list)
+tcp_print_list_impl(list_node_t *tcp_list)
 {
-    tcp_info_t *tcp = tcp_list;
+    list_node_t *node = tcp_list;
     D("[D] tcps:")
-    while (tcp) {
-	D(" %d (%d, %d)", tcp->tcpfd, tcp->prev ? tcp->prev->tcpfd : 0, tcp->next ? tcp->next->tcpfd : 0)
-	tcp = tcp->next;
+    while (node) {
+	D(" %d", ((tcp_info_t *) node->data)->tcpfd)
+	node = node->next;
     }
     D("\n")
-}
-#endif
-
-static int
-tcp_compare(void *t1, void *t2)
-{
-    tcp_info_t *tcp1 = (tcp_info_t *) t1;
-    tcp_info_t *tcp2 = (tcp_info_t *) t2;
-    return (tcp1->tcpfd == tcp2->tcpfd) ? 0 : (tcp1->tcpfd < tcp2->tcpfd ? -1 : 1);
 }
 
 static int
 tcp_insert(port_info_t *port, tcp_info_t *tcp)
 {
-    if (NULL == port->tcp_list) {
-	port->tcp_list = tcp;
-    } else {
-	tcp_info_t *p;
-	p = port->tcp_list;
-	while (p->next) {
-	    p = p->next;
-	}
-	tcp->next = p->next;
-	if (tcp->next)
-	    tcp->next->prev = tcp;
-	p->next = tcp;
-	tcp->prev = p;
-    }
+    list_node_t *node = list_new_node(tcp);
 
+    if (!node)
+	return -1;
+
+    list_insert(&port->tcp_list, node, NULL);
     tcp->port = port;
     tcp->timeout = port->timeout;
 
-    tcp_print_list(port->tcp_list)
+    tcp_print_list(port->tcp_list);
 
     return 0;
 }
@@ -742,50 +609,46 @@ tcp_free(tcp_info_t *tcp)
 static tcp_info_t *
 tcp_find_in_port(port_info_t *port, int fd)
 {
-    tcp_info_t *tcp = port->tcp_list;
-    while (tcp) {
+    list_node_t *node = port->tcp_list;
+    tcp_info_t *tcp;
+    while (node) {
+	tcp = (tcp_info_t *) node->data;
 	if (tcp->tcpfd == fd)
 	    return tcp;
-	tcp = tcp->next;
+	node = node->next;
     }
     return NULL;
+}
+
+static int
+tcp_compare(void *t1, void *t2)
+{
+    tcp_info_t *tcp1 = (tcp_info_t *) t1;
+    tcp_info_t *tcp2 = (tcp_info_t *) t2;
+    return (tcp1->tcpfd == tcp2->tcpfd) ? 0 : (tcp1->tcpfd < tcp2->tcpfd ? -1 : 1);
 }
 
 static void
 tcp_close(tcp_info_t *tcp)
 {
     sel_stop_timer(tcp->timer);
-    if (tcp->tcpfd != -1) {
-	sel_clear_fd_handlers(ser2net_sel, tcp->tcpfd);
-	close(tcp->tcpfd);
-    }
-    if (tcp->banner) {
-	free(tcp->banner->buf);
- 	free(tcp->banner);
-	tcp->banner = NULL;
-    }
+    sel_clear_fd_handlers(ser2net_sel, tcp->tcpfd);
+    close(tcp->tcpfd);
     tcp->tcp_bytes_received = 0;
     tcp->tcp_bytes_sent = 0;
     tcp->dev_to_tcp_state = PORT_UNCONNECTED;
-    buffer_reset(&tcp->dev_to_tcp);
+    tcp->dev_to_tcp_buf_start = 0;
+    tcp->dev_to_tcp_buf_count = 0;
 }
 
 static void
 tcp_remove(port_info_t *port, tcp_info_t *tcp)
 {
-    if (tcp->prev) {
-	tcp->prev->next = tcp->next;
-    } else {
-	port->tcp_list = tcp->next;
-    }
-    if (tcp->next) {
-	tcp->next->prev = tcp->prev;
-    }
-    tcp->prev = tcp->next = NULL;
-
+    list_node_t *node = list_remove_data(&port->tcp_list, tcp, tcp_compare);
     tcp_free(tcp);
+    list_delete_node(node);
 
-    tcp_print_list(port->tcp_list)
+    tcp_print_list(port->tcp_list);
 }
 
 static void
@@ -794,6 +657,20 @@ tcp_shutdown(tcp_info_t *tcp, char *reason)
     D("tcp %d shutdown: %s\n", tcp->tcpfd, reason)
     tcp_close(tcp);
     tcp_remove(tcp->port, tcp);
+}
+
+static void
+tcp_shutdown_all(list_node_t *queue, char *reason)
+{
+    tcp_info_t *tcp = NULL;
+    if (!queue)
+	return;
+    tcp_shutdown_all(queue->next, reason);
+    tcp = (tcp_info_t *) queue->data;
+    D("tcp %d shutdown: %s\n", tcp->tcpfd, reason)
+    tcp_close(tcp);
+    tcp_free(tcp);
+    list_delete_node(queue);
 }
 
 static void
@@ -806,13 +683,15 @@ tcp_set_fd_write_handler(tcp_info_t *tcp, int state)
 	sel_set_fd_read_handler(ser2net_sel, port->devfd, SEL_FD_HANDLER_DISABLED);
 	port->dev_to_tcp_state = PORT_WAITING_OUTPUT_CLEAR;
     } else if (SEL_FD_HANDLER_DISABLED == state) {
-	tcp_info_t *t = port->tcp_list;
-	while (t) {
-	    if (t->dev_to_tcp.cursize != 0) {
-		D("tcp %d still has %d\n", t->tcpfd, t->dev_to_tcp.cursize)
+	list_node_t *node = port->tcp_list;
+	tcp_info_t *t = NULL;
+	while (node) {
+	    t = (tcp_info_t *)node->data;
+	    if (t->dev_to_tcp_buf_count != 0) {
+		D("tcp %d still has %d\n", t->tcpfd, t->dev_to_tcp_buf_count)
 		return;
 	    }
-	    t = t->next;
+	    node = node->next;
 	}
 	sel_set_fd_read_handler(ser2net_sel, port->devfd, SEL_FD_HANDLER_ENABLED);
     }
@@ -821,12 +700,13 @@ tcp_set_fd_write_handler(tcp_info_t *tcp, int state)
 static void
 tcp_set_fd_read_handler(port_info_t *port, int state)
 {
-    tcp_info_t *tcp = port->tcp_list;
+    list_node_t *node = port->tcp_list;
+    tcp_info_t *tcp = NULL;
 
-    while (tcp) {
-	sel_set_fd_read_handler(ser2net_sel, tcp->tcpfd, state);
+    while (node) {
+	tcp = (tcp_info_t *)node->data;
 	tcp_reset_timer(tcp);
-	tcp = tcp->next;
+	node = node->next;
     }
 
     if (SEL_FD_HANDLER_ENABLED == state)
@@ -836,163 +716,173 @@ tcp_set_fd_read_handler(port_info_t *port, int state)
 }
 
 static void
-tcp_write_to(tcp_info_t *tcp)
+tcp_write_to(port_info_t *port, tcp_info_t *tcp, unsigned char *buf, int count)
 {
-    port_info_t *port = tcp->port;
-    int count;
+    int write_count;
+    int waiting_output = 0;
 
-retry_write:
-    count = write(tcp->tcpfd, tcp->dev_to_tcp.buf, tcp->dev_to_tcp.cursize);
-    if (count == -1) {
+    tcp->dev_to_tcp_buf_start = 0;
+    if (PORT_HTTP == port->enabled) {
+	http_process_response(&tcp->ht_data, buf, count);
+    } else {
+	tcp->dev_to_tcp_buf_count = count;
+	memcpy(tcp->dev_to_tcp_buf, buf, count);
+    }
+
+retry_tcp_write:
+    write_count = write(tcp->tcpfd, tcp->dev_to_tcp_buf, tcp->dev_to_tcp_buf_count);
+    if (write_count == -1) {
 	if (errno == EINTR) {
 	    /* EINTR means we were interrupted, just retry. */
-	    goto retry_write;
-	}
-
-	if (errno == EAGAIN) {
+	    goto retry_tcp_write;
+	} else if (errno == EAGAIN) {
 	    /* This was due to O_NONBLOCK, we need to shut off the reader
 	       and start the writer monitor. */
-	    tcp_set_fd_write_handler(tcp, SEL_FD_HANDLER_ENABLED);
+	    waiting_output = 1;
 	} else if (errno == EPIPE) {
 	    shutdown_port(port, tcp, "EPIPE");
 	    return;
 	} else {
 	    /* Some other bad error. */
 	    syslog(LOG_ERR, "The tcp write for port %s had error: %m",
-		    port->portname);
+		   port->portname);
 	    shutdown_port(port, tcp, "tcp write error");
 	    return;
 	}
     } else {
-	tcp->tcp_bytes_sent += count;
-	port->tcp_bytes_sent += count;
-	tcp->dev_to_tcp.cursize -= count;
-	if (tcp->dev_to_tcp.cursize != 0) {
+	tcp->tcp_bytes_sent += write_count;
+	tcp->dev_to_tcp_buf_count -= write_count;
+	if (tcp->dev_to_tcp_buf_count != 0) {
 	    /* We didn't write all the data, shut off the reader and
 	       start the write monitor. */
-	    tcp->dev_to_tcp.pos = count;
-	    tcp_set_fd_write_handler(tcp, SEL_FD_HANDLER_ENABLED);
-	    port->dev_to_tcp_state = PORT_WAITING_OUTPUT_CLEAR;
+	    tcp->dev_to_tcp_buf_start += write_count;
+	    waiting_output = 1;
 	}
+    }
+
+    if (waiting_output) {
+	tcp_set_fd_write_handler(tcp, SEL_FD_HANDLER_ENABLED);
     }
 
     tcp_reset_timer(tcp);
 }
 
 static void
-tcp_write(port_info_t *port)
+tcp_write(port_info_t *port, unsigned char *buf, int count)
 {
-    tcp_info_t *tcp = port->tcp_list;
+    list_node_t *node = port->tcp_list;
+    tcp_info_t *tcp = NULL;
 
-    while (tcp) {
-	tcp->dev_to_tcp.pos = 0;
-	if (PORT_HTTP == port->enabled) {
-	  http_process_response(&tcp->ht_data, port->dev_to_tcp.buf, port->dev_to_tcp.cursize);
-	} else {
-	  buffer_output(&tcp->dev_to_tcp, port->dev_to_tcp.buf, port->dev_to_tcp.cursize);
-	}
-	tcp_write_to(tcp);
-	tcp = tcp->next;
+    while (node) {
+	tcp = (tcp_info_t *) node->data;
+	tcp_write_to(port, tcp, buf, count);
+	node = node->next;
     }
 }
-
 
 /* Data is ready to read on the serial port. */
 static void
 handle_dev_fd_read(int fd, void *data)
 {
     port_info_t *port = (port_info_t *) data;
-    int count;
 
-    port->dev_to_tcp.pos = 0;
+    port->dev_to_tcp_buf_start = 0;
     if (port->enabled == PORT_TELNET) {
 	/* Leave room for IACs. */
-	count = read(fd, port->dev_to_tcp.buf, port->tcp_to_dev.maxsize/2);
-    } else if (port->enabled == PORT_HTTP) {
-	/* Leave room for websocket. */
-	count = read(fd, port->dev_to_tcp.buf, port->tcp_to_dev.maxsize/2);
+	port->dev_to_tcp_buf_count = read(fd, port->dev_to_tcp_buf,
+					  PORT_BUFSIZE/2);
     } else {
-	count = read(fd, port->dev_to_tcp.buf, port->tcp_to_dev.maxsize);
+	port->dev_to_tcp_buf_count = read(fd, port->dev_to_tcp_buf,
+					  PORT_BUFSIZE);
     }
 
-    if (count < 0) {
+    if (port->dev_monitor != NULL) {
+	controller_write(port->dev_monitor,
+			 (char *) port->dev_to_tcp_buf,
+			 port->dev_to_tcp_buf_count);
+    }
+
+    if (port->dev_to_tcp_buf_count < 0) {
 	/* Got an error on the read, shut down the port. */
 	syslog(LOG_ERR, "dev read error for port %s: %m", port->portname);
 	shutdown_port(port, NULL, "dev read error");
 	return;
-    } else if (count == 0) {
+    } else if (port->dev_to_tcp_buf_count == 0) {
 	/* The port got closed somehow, shut it down. */
 	shutdown_port(port, NULL, "closed port");
 	return;
     }
 
-    if (port->dev_monitor != NULL) {
-	controller_write(port->dev_monitor,
-			 (char *) port->dev_to_tcp.buf,
-			 count);
-    }
-
-    if (port->rt.file != -1)
+    if (port->rt_file != -1)
 	/* Do read tracing, ignore errors. */
-	do_trace(port, &port->rt, port->dev_to_tcp.buf, count, SERIAL);
-    if (port->bt.file != -1)
+	do_trace(port, port->rt_file,
+		 port->dev_to_tcp_buf, port->dev_to_tcp_buf_count);
+    if (port->bt_file != -1)
 	/* Do both tracing, ignore errors. */
-	do_trace(port, &port->bt, port->dev_to_tcp.buf, count, SERIAL);
+	do_trace(port, port->bt_file,
+		 port->dev_to_tcp_buf, port->dev_to_tcp_buf_count);
 
-    port->dev_bytes_received += count;
+    port->dev_bytes_received += port->dev_to_tcp_buf_count;
 
     if (port->enabled == PORT_TELNET) {
 	int i, j;
 
 	/* Double the IACs on a telnet stream.  This will fit because
 	   we only use half the buffer for telnet connections. */
-	for (i=0; i<count; i++) {
-	    if (port->dev_to_tcp.buf[i] == 255) {
-		for (j=count; j>i; j--)
-		    port->dev_to_tcp.buf[j+1] = port->dev_to_tcp.buf[j];
-		count++;
+	for (i=0; i<port->dev_to_tcp_buf_count; i++) {
+	    if (port->dev_to_tcp_buf[i] == 255) {
+		for (j=port->dev_to_tcp_buf_count; j>i; j--)
+		    port->dev_to_tcp_buf[j+1] = port->dev_to_tcp_buf[j];
+		port->dev_to_tcp_buf_count++;
 		i++;
-		port->dev_to_tcp.buf[i] = 255;
+		port->dev_to_tcp_buf[i] = 255;
 	    }
 	}
     }
 
-    port->dev_to_tcp.cursize = count;
-
-    tcp_write(port);
+    tcp_write(port, port->dev_to_tcp_buf, port->dev_to_tcp_buf_count);
 }
 
 /* The serial port has room to write some data.  This is only activated
    if a write fails to complete, it is deactivated as soon as writing
    is available again. */
 static void
-dev_fd_write(port_info_t *port, struct sbuf *buf)
-{
-    int reterr, buferr;
-
-    reterr = buffer_write(port->devfd, buf, &buferr);
-    if (reterr == -1) {
-	syslog(LOG_ERR, "The dev write for port %s had error: %m",
-	       port->portname);
-	shutdown_port(port, NULL, "dev write error");
-	return;
-    }
-
-    if (buffer_cursize(buf) == 0) {
-	/* We are done writing, turn the reader back on. */
-	tcp_set_fd_read_handler(port, SEL_FD_HANDLER_ENABLED);
-	port->tcp_to_dev_state = PORT_WAITING_INPUT;
-    }
-
-    reset_timer(port);
-}
-
-static void
 handle_dev_fd_write(int fd, void *data)
 {
     port_info_t *port = (port_info_t *) data;
+    int write_count;
 
-    dev_fd_write(port, &port->tcp_to_dev);
+    write_count = write(port->devfd,
+			&(port->tcp_to_dev_buf[port->tcp_to_dev_buf_start]),
+			port->tcp_to_dev_buf_count);
+
+    if (write_count == -1) {
+	if (errno == EINTR) {
+	    /* EINTR means we were interrupted, just retry by returning. */
+	    return;
+	}
+
+	if (errno == EAGAIN) {
+	    /* This again was due to O_NONBLOCK, just ignore it. */
+	} else {
+	    /* Some other bad error. */
+	    syslog(LOG_ERR, "The dev write for port %s had error: %m",
+		   port->portname);
+	    shutdown_port(port, NULL, "dev write error");
+	    return;
+	}
+    } else {
+	port->dev_bytes_sent += write_count;
+	port->tcp_to_dev_buf_count -= write_count;
+	if (port->tcp_to_dev_buf_count != 0) {
+	    /* We didn't write all the data, continue writing. */
+	    port->tcp_to_dev_buf_start += write_count;
+	} else {
+	    /* We are done writing, turn the reader back on. */
+	    tcp_set_fd_read_handler(port, SEL_FD_HANDLER_ENABLED);
+	    port->tcp_to_dev_state = PORT_WAITING_INPUT;
+	}
+    }
 }
 
 /* Handle an exception from the serial port. */
@@ -1006,72 +896,33 @@ handle_dev_fd_except(int fd, void *data)
     shutdown_port(port, NULL, "fd exception");
 }
 
-/* Output the devstr buffer */
-static void
-handle_dev_fd_devstr_write(int fd, void *data)
-{
-    port_info_t *port = (port_info_t *) data;
-
-    dev_fd_write(port, port->devstr);
-    if (buffer_cursize(port->devstr) == 0) {
-	sel_set_fd_handlers(ser2net_sel,
-			    port->devfd,
-			    port,
-			    handle_dev_fd_read,
-			    handle_dev_fd_write,
-			    handle_dev_fd_except);
-	free(port->devstr->buf);
-	free(port->devstr);
-	port->devstr = NULL;    }
-}
-
-/* Output the devstr buffer */
-static void
-handle_dev_fd_close_write(int fd, void *data)
-{
-    port_info_t *port = (port_info_t *) data;
-    int reterr, buferr;
-
-    reterr = buffer_write(port->devfd, port->devstr, &buferr);
-    if (reterr == -1) {
-	syslog(LOG_ERR, "The dev write for port %s had error: %m",
-	       port->portname);
-	goto closeit;
-    }
-
-    if (buffer_cursize(port->devstr) != 0)
-	return;
-
-closeit:
-    finish_shutdown_port(port);
-}
-
 /* Data is ready to read on the TCP port. */
 static void
 handle_tcp_fd_read(int fd, void *data)
 {
     port_info_t *port = (port_info_t *) data;
     tcp_info_t *tcp = NULL;
-    int count;
+    int write_count;
 
     tcp = tcp_find_in_port(port, fd);
 
     if (PORT_HTTP == port->enabled) {
-	char *rv = http_process_request(&tcp->ht_data, fd);
-	if (rv) {
-	    /* Got an error on the read, shut down the port. */
-	    shutdown_port(port, tcp, rv);
-	    return;
-	}
-	if (port->tcp_to_dev.cursize > 0) {
-	    goto write_to_dev;
-	}
-	return;
+      char *rv = http_process_request(&tcp->ht_data, fd);
+      if (rv) {
+        /* Got an error on the read, shut down the port. */
+        shutdown_port(port, tcp, rv);
+        return;
+      }
+      if (port->tcp_to_dev_buf_count > 0) {
+        goto write_to_dev;
+      }
+      return;
     }
 
-    port->tcp_to_dev.pos = 0;
-    count = read(fd, port->tcp_to_dev.buf, port->tcp_to_dev.maxsize);
-    if (count < 0) {
+    port->tcp_to_dev_buf_start = 0;
+    port->tcp_to_dev_buf_count = read(fd, port->tcp_to_dev_buf, PORT_BUFSIZE);
+
+    if (port->tcp_to_dev_buf_count < 0) {
 	/* Got an error on the read, shut down the port. */
 	syslog(LOG_ERR, "read error for port %s: %m", port->portname);
 	shutdown_port(port, tcp, "tcp read error");
@@ -1080,7 +931,7 @@ handle_tcp_fd_read(int fd, void *data)
 	    startup_port(port);
 	}
 	return;
-    } else if (count == 0) {
+    } else if (port->tcp_to_dev_buf_count == 0) {
 	/* The other end closed the port, shut it down. */
 	shutdown_port(port, tcp, "tcp read close");
 	if (PORT_REMOTE_RAW == port->enabled) {
@@ -1089,21 +940,17 @@ handle_tcp_fd_read(int fd, void *data)
 	}
 	return;
     }
-    port->tcp_to_dev.cursize = count;
-
 write_to_dev:
-    port->tcp_bytes_received += count;
-    tcp->tcp_bytes_received += count;
+    port->tcp_bytes_received += port->tcp_to_dev_buf_count;
 
     if (port->enabled == PORT_TELNET) {
-	port->tcp_to_dev.cursize = process_telnet_data(port->tcp_to_dev.buf,
-						       count,
-						       &tcp->tn_data);
+	port->tcp_to_dev_buf_count = process_telnet_data
+	    (port->tcp_to_dev_buf, port->tcp_to_dev_buf_count, &tcp->tn_data);
 	if (tcp->tn_data.error) {
 	    shutdown_port(port, tcp, "telnet output error");
 	    return;
 	}
-	if (port->tcp_to_dev.cursize == 0) {
+	if (port->tcp_to_dev_buf_count == 0) {
 	    /* We are out of characters; they were all processed.  We
 	       don't want to continue with 0, because that will mess
 	       up the other processing and it's not necessary. */
@@ -1113,22 +960,24 @@ write_to_dev:
 
     if (port->tcp_monitor != NULL) {
 	controller_write(port->tcp_monitor,
-			 (char *) port->tcp_to_dev.buf,
-			 port->tcp_to_dev.cursize);
+			 (char *) port->tcp_to_dev_buf,
+			 port->tcp_to_dev_buf_count);
     }
 
-    if (port->wt.file != -1)
+    if (port->wt_file != -1)
 	/* Do write tracing, ignore errors. */
-	do_trace(port, &port->wt,
-		 port->tcp_to_dev.buf, port->tcp_to_dev.cursize, NET);
-    if (port->bt.file != -1)
+	do_trace(port, port->wt_file,
+		 port->tcp_to_dev_buf, port->tcp_to_dev_buf_count);
+    if (port->bt_file != -1)
 	/* Do both tracing, ignore errors. */
-	do_trace(port, &port->bt,
-		 port->tcp_to_dev.buf, port->tcp_to_dev.cursize, NET);
+	do_trace(port, port->bt_file,
+		 port->tcp_to_dev_buf, port->tcp_to_dev_buf_count);
 
  retry_write:
-    count = write(port->devfd, port->tcp_to_dev.buf, port->tcp_to_dev.cursize);
-    if (count == -1) {
+    write_count = write(port->devfd,
+			port->tcp_to_dev_buf,
+			port->tcp_to_dev_buf_count);
+    if (write_count == -1) {
 	if (errno == EINTR) {
 	    /* EINTR means we were interrupted, just retry. */
 	    goto retry_write;
@@ -1147,12 +996,12 @@ write_to_dev:
 	    return;
 	}
     } else {
-	port->dev_bytes_sent += count;
-	port->tcp_to_dev.cursize -= count;
-	if (port->tcp_to_dev.cursize != 0) {
+	port->dev_bytes_sent += write_count;
+	port->tcp_to_dev_buf_count -= write_count;
+	if (port->tcp_to_dev_buf_count != 0) {
 	    /* We didn't write all the data, shut off the reader and
                start the write monitor. */
-	    port->tcp_to_dev.pos = count;
+	    port->tcp_to_dev_buf_start += write_count;
 	    tcp_set_fd_read_handler(port, SEL_FD_HANDLER_DISABLED);
 	    port->tcp_to_dev_state = PORT_WAITING_OUTPUT_CLEAR;
 	}
@@ -1163,89 +1012,93 @@ write_to_dev:
    if a write fails to complete, it is deactivated as soon as writing
    is available again. */
 static void
-tcp_fd_write(tcp_info_t *tcp, struct sbuf *buf)
+handle_tcp_fd_write(int fd, void *data)
 {
-    port_info_t *port = tcp->port;
-    telnet_data_t *td = &tcp->tn_data;
-    http_data_t *hd = &tcp->ht_data;
-    int buferr, reterr;
+    port_info_t *port = (port_info_t *) data;
+    telnet_data_t *td = NULL;
+    http_data_t *hd = NULL;
+    tcp_info_t *tcp;
+    int write_count;
 
-    if (buffer_cursize(&td->out_telnet_cmd) > 0) {
-	reterr = buffer_write(tcp->tcpfd, &td->out_telnet_cmd, &buferr);
-	if (reterr == -1) {
-	    if (buferr == EPIPE) {
+    tcp = tcp_find_in_port(port, fd);
+    hd = &tcp->ht_data;
+    td = &tcp->tn_data;
+
+    if (td->out_telnet_cmd_size > 0) {
+	write_count = write(tcp->tcpfd,
+			    &(td->out_telnet_cmd[0]),
+			    td->out_telnet_cmd_size);
+	if (write_count == -1) {
+	    if (errno == EINTR) {
+		/* EINTR means we were interrupted, just retry by returning. */
+		return;
+	    }
+
+	    if (errno == EAGAIN) {
+		/* This again was due to O_NONBLOCK, just ignore it. */
+	    } else if (errno == EPIPE) {
 		shutdown_port(port, tcp, "EPIPE");
+		return;
 	    } else {
 		/* Some other bad error. */
 		syslog(LOG_ERR, "The tcp write for port %s had error: %m",
 		       port->portname);
 		shutdown_port(port, tcp, "tcp write error");
+		return;
 	    }
-	}
+	} else {
+	    int i, j;
 
-	if (buffer_cursize(&td->out_telnet_cmd) > 0) {
-	    /* If we have more telnet command data to send, don't
-	       send any real data. */
+	    /* Copy the remaining data. */
+	    for (j=0, i=write_count; i<td->out_telnet_cmd_size; i++, j++)
+		td->out_telnet_cmd[j] = td->out_telnet_cmd[i];
+	    td->out_telnet_cmd_size -= write_count;
+	    if (td->out_telnet_cmd_size != 0)
+		/* If we have more telnet command data to send, don't
+		   send any real data. */
+		return;
+	}
+    }
+
+    write_count = write(tcp->tcpfd,
+			&(tcp->dev_to_tcp_buf[tcp->dev_to_tcp_buf_start]),
+			tcp->dev_to_tcp_buf_count);
+    if (write_count == -1) {
+	if (errno == EINTR) {
+	    /* EINTR means we were interrupted, just retry by returning. */
 	    return;
 	}
-    }
 
-    if (buffer_cursize(&hd->response) > 0) {
-      reterr = buffer_write(tcp->tcpfd, &hd->response, &buferr);
-      if (reterr == -1) {
-          if (buferr == EPIPE) {
-              shutdown_port(port, tcp, "EPIPE");
-          } else {
-              /* Some other bad error. */
-              syslog(LOG_ERR, "The tcp write for port %s had error: %m",
-                     port->portname);
-              shutdown_port(port, tcp, "tcp write error");
-          }
-      }
-
-      if (buffer_cursize(&hd->response) > 0) {
-          /* If we have more http data to send, don't
-             send any real data. */
-          return;
-      }
-    }
-
-    reterr = buffer_write(tcp->tcpfd, buf, &buferr);
-    if (reterr == -1) {
-	if (buferr == EPIPE) {
+	if (errno == EAGAIN) {
+	    /* This again was due to O_NONBLOCK, just ignore it. */
+	} else if (errno == EPIPE) {
 	    shutdown_port(port, tcp, "EPIPE");
+	    return;
 	} else {
 	    /* Some other bad error. */
 	    syslog(LOG_ERR, "The tcp write for port %s had error: %m",
 		   port->portname);
 	    shutdown_port(port, tcp, "tcp write error");
+	    return;
 	}
-	return;
-    }
-    if (buffer_cursize(buf) == 0) {
-	if (PORT_HTTP == port->enabled && HTTP_CLOSING == hd->state) {
-	    D("state: %d\n", hd->state)
+    } else {
+	tcp->tcp_bytes_sent += write_count;
+	tcp->dev_to_tcp_buf_count -= write_count;
+	if (tcp->dev_to_tcp_buf_count != 0) {
+	    /* We didn't write all the data, continue writing. */
+	    tcp->dev_to_tcp_buf_start += write_count;
+	} else if (PORT_HTTP == port->enabled && HTTP_CLOSING == hd->state) {
 	    hd->state = HTTP_UNCONNECTED;
 	    shutdown_port(port, tcp, "receive close frame");
 	    return;
+	} else {
+	    /* We are done writing, turn the reader back on. */
+	    tcp_set_fd_write_handler(tcp, SEL_FD_HANDLER_DISABLED);
+	    port->dev_to_tcp_state = PORT_WAITING_INPUT;
 	}
-	/* We are done writing, turn the reader back on. */
-	tcp_set_fd_write_handler(tcp, SEL_FD_HANDLER_DISABLED);
-	port->dev_to_tcp_state = PORT_WAITING_INPUT;
     }
 
     tcp_reset_timer(tcp);
-}
-
-/* The TCP port has room to write some data.  This is only activated
-   if a write fails to complete, it is deactivated as soon as writing
-   is available again. */
-static void
-handle_tcp_fd_write(int fd, void *data)
-{
-    port_info_t *port = (port_info_t *) data;
-    tcp_info_t *tcp = tcp_find_in_port(port, fd);
-    tcp_fd_write(tcp, &tcp->dev_to_tcp);
 }
 
 /* Handle an exception from the TCP port. */
@@ -1259,26 +1112,6 @@ handle_tcp_fd_except(int fd, void *data)
 
     syslog(LOG_ERR, "Select exception on port %s", port->portname);
     shutdown_port(port, tcp, "tcp fd exception");
-}
-
-static void
-handle_tcp_fd_banner_write(int fd, void *data)
-{
-    port_info_t *port = (port_info_t *) data;
-    tcp_info_t *tcp = tcp_find_in_port(port, fd);
-
-    tcp_fd_write(tcp, tcp->banner);
-    if (buffer_cursize(tcp->banner) == 0) {
-	sel_set_fd_handlers(ser2net_sel,
-			    tcp->tcpfd,
-			    port,
-			    handle_tcp_fd_read,
-			    handle_tcp_fd_write,
-			    handle_tcp_fd_except);
-	free(tcp->banner->buf);
-	free(tcp->banner);
-	tcp->banner = NULL;
-    }
 }
 
 static void
@@ -1322,8 +1155,22 @@ http_to_dev_buf(void *cb_data, unsigned char *buf, int size)
     port_info_t *port = tcp->port;
     int len = size < PORT_BUFSIZE ? size : PORT_BUFSIZE;
 
-    port->tcp_to_dev.pos = 0;
-    buffer_output(&port->tcp_to_dev, buf, len);
+    port->tcp_to_dev_buf_start = 0;
+    memcpy(port->tcp_to_dev_buf + port->tcp_to_dev_buf_count, buf, len);
+    port->tcp_to_dev_buf_count += len;
+
+    return len;
+}
+
+static int
+http_to_tcp_buf(void *cb_data, unsigned char *buf, int size)
+{
+    tcp_info_t *tcp = (tcp_info_t *) cb_data;
+    int len = size < PORT_BUFSIZE ? size : PORT_BUFSIZE;
+
+    tcp->dev_to_tcp_buf_start = 0;
+    memcpy(tcp->dev_to_tcp_buf + tcp->dev_to_tcp_buf_count, buf, len);
+    tcp->dev_to_tcp_buf_count += len;
 
     return len;
 }
@@ -1348,29 +1195,39 @@ is_device_already_inuse(port_info_t *check_port)
     return 0;
 }
 
+static void
+add_port_tcp_char(tcp_info_t *tcp, char c)
+{
+    int pos = tcp->dev_to_tcp_buf_start + tcp->dev_to_tcp_buf_count;
+    if (pos >= PORT_BUFSIZE)
+	return;
+    tcp->dev_to_tcp_buf[pos] = c;
+    tcp->dev_to_tcp_buf_count++;
+}
+
 static int
 from_hex_digit(char c)
 {
     if ((c >= '0') && (c <= '9'))
 	return c - '0';
     if ((c >= 'A') && (c <= 'F'))
-	return c - 'A' + 10;
+	return c = 'A' + 10;
     if ((c >= 'a') && (c <= 'f'))
-	return c - 'a' + 10;
+	return c = 'a' + 10;
     return 0;
 }
 
-static char *smonths[] = { "Jan", "Feb", "Mar", "Apr", "May", "Jun",
-			   "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
-static char *sdays[] = { "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
-
 static void
-process_str(port_info_t *port, struct tm *time, struct timeval *tv, char *s,
-	    void (*op)(void *data, char val), void *data, int isfilename)
+display_banner(port_info_t *port, tcp_info_t *tcp)
 {
     char val;
+    char *s;
     char *t;
 
+    if (!port->dinfo.banner)
+	return;
+
+    s = port->dinfo.banner;
     while (*s) {
 	if (*s == '\\') {
 	    s++;
@@ -1378,52 +1235,37 @@ process_str(port_info_t *port, struct tm *time, struct timeval *tv, char *s,
 		return;
 	    switch (*s) {
 	    /* Standard "C" characters. */
-	    case 'a': op(data, 7); break;
-	    case 'b': op(data, 8); break;
-	    case 'f': op(data, 12); break;
-	    case 'n': op(data, 10); break;
-	    case 'r': op(data, 13); break;
-	    case 't': op(data, 9); break;
-	    case 'v': op(data, 11); break;
-	    case '\\': op(data, '\\'); break;
-	    case '?': op(data, '?'); break;
-	    case '\'': op(data, '\''); break;
-	    case '"': op(data, '"'); break;
+	    case 'a': add_port_tcp_char(tcp, 7); break;
+	    case 'b': add_port_tcp_char(tcp, 8); break;
+	    case 'f': add_port_tcp_char(tcp, 12); break;
+	    case 'n': add_port_tcp_char(tcp, 10); break;
+	    case 'r': add_port_tcp_char(tcp, 13); break;
+	    case 't': add_port_tcp_char(tcp, 9); break;
+	    case 'v': add_port_tcp_char(tcp, 11); break;
+	    case '\\': add_port_tcp_char(tcp, '\\'); break;
+	    case '?': add_port_tcp_char(tcp, '?'); break;
+	    case '\'': add_port_tcp_char(tcp, '\''); break;
+	    case '"': add_port_tcp_char(tcp, '"'); break;
 
 	    case 'd':
 		/* ser2net device name. */
-		if (isfilename) {
-		    /* Can't have '/' in a filename. */
-		    t = strrchr(port->devname, '/');
-		    if (t)
-			t++;
-		    else
-			t = port->devname;
-		} else
-		    t = port->devname;
-		for (; *t; t++)
-		    op(data, *t);
+		for (t=port->devname; *t; t++)
+		    add_port_tcp_char(tcp, *t);
 		break;
 
 	    case 'p':
 		/* ser2net TCP port. */
 		for (t=port->portname; *t; t++)
-		    op(data, *t);
+		    add_port_tcp_char(tcp, *t);
 		break;
 
 	    case 's':
-		if (isfilename)
-		    goto seconds;
-		goto serparms;
-
-	    case 'B':
-	    serparms:
 		/* ser2net serial parms. */
 		{
 		    char str[15];
 		    serparm_to_str(str, sizeof(str), &(port->dinfo.termctl));
 		    for (t=str; *t; t++)
-			op(data, *t);
+			add_port_tcp_char(tcp, *t);
 		}
 		break;
 
@@ -1433,7 +1275,7 @@ process_str(port_info_t *port, struct tm *time, struct timeval *tv, char *s,
 		val = (*s) - '0';
 		s++;
 		if (!*s) {
-		    op(data, val);
+		    add_port_tcp_char(tcp, val);
 		    return;
 		}
 		if (!isdigit(*s)) {
@@ -1442,7 +1284,7 @@ process_str(port_info_t *port, struct tm *time, struct timeval *tv, char *s,
 		val = (val * 8) + (*s) - '0';
 		s++;
 		if (!*s) {
-		    op(data, val);
+		    add_port_tcp_char(tcp, val);
 		    return;
 		}
 		if (!isdigit(*s)) {
@@ -1461,7 +1303,7 @@ process_str(port_info_t *port, struct tm *time, struct timeval *tv, char *s,
 		val = from_hex_digit(*s);
 		s++;
 		if (!*s) {
-		    op(data, val);
+		    add_port_tcp_char(tcp, val);
 		    return;
 		}
 		if (!isdigit(*s))
@@ -1469,286 +1311,350 @@ process_str(port_info_t *port, struct tm *time, struct timeval *tv, char *s,
 		val = (val * 16) + from_hex_digit(*s);
 		break;
 
-	    /* \Y -> year */
-	    case 'Y':
-	    {
-		char d[10], *dp;
-		snprintf(d, sizeof(d), "%d", time->tm_year + 1900);
-		for (dp = d; *dp; dp++)
-		    op(data, *dp);
-		break;
-	    }
-
-	    /* \y -> day of the year (days since Jan 1) */
-	    case 'y':
-	    {
-		char d[10], *dp;
-		snprintf(d, sizeof(d), "%d", time->tm_yday);
-		for (dp = d; *dp; dp++)
-		    op(data, *dp);
-		break;
-	    }
-
-	    /* \M -> month (Jan, Feb, Mar, etc.) */
-	    case 'M':
-		if (time->tm_mon >= 12)
-		    op(data, '?');
-		else {
-		    char *dp = smonths[time->tm_mon];
-		    for (; *dp; dp++)
-			op(data, *dp);
-		}
-		break;
-
-	    /* \m -> month (as a number) */
-	    case 'm':
-	    {
-		char d[10], *dp;
-		snprintf(d, sizeof(d), "%d", time->tm_mon);
-		for (dp = d; *dp; dp++)
-		    op(data, *dp);
-		break;
-	    }
-
-	    /* \A -> day of the week (Mon, Tue, etc.) */
-	    case 'A':
-		if (time->tm_wday >= 7)
-		    op(data, '?');
-		else {
-		    char *dp = sdays[time->tm_wday];
-		    for (; *dp; dp++)
-			op(data, *dp);
-		}
-		break;
-
-	    /* \D -> day of the month */
-	    case 'D':
-	    {
-		char d[10], *dp;
-		snprintf(d, sizeof(d), "%d", time->tm_mday);
-		for (dp = d; *dp; dp++)
-		    op(data, *dp);
-		break;
-	    }
-
-	    /* \H -> hour (24-hour time) */
-	    case 'H':
-	    {
-		char d[10], *dp;
-		snprintf(d, sizeof(d), "%2.2d", time->tm_hour);
-		for (dp = d; *dp; dp++)
-		    op(data, *dp);
-		break;
-	    }
-
-	    /* \h -> hour (12-hour time) */
-	    case 'h':
-	    {
-		char d[10], *dp;
-		int v;
-
-		v = time->tm_hour;
-		if (v == 0)
-		    v = 12;
-		else if (v > 12)
-		    v -= 12;
-		snprintf(d, sizeof(d), "%2.2d", v);
-		for (dp = d; *dp; dp++)
-		    op(data, *dp);
-		break;
-	    }
-
-	    /* \i -> minute */
-	    case 'i':
-	    {
-		char d[10], *dp;
-		snprintf(d, sizeof(d), "%2.2d", time->tm_min);
-		for (dp = d; *dp; dp++)
-		    op(data, *dp);
-		break;
-	    }
-
-	    /* \S -> second */
-	    case 'S':
-	    seconds:
-	    {
-		char d[10], *dp;
-		snprintf(d, sizeof(d), "%2.2d", time->tm_sec);
-		for (dp = d; *dp; dp++)
-		    op(data, *dp);
-		break;
-	    }
-
-	    /* \q -> am/pm */
-	    case 'q':
-		if (time->tm_hour < 12) {
-		    op(data, 'a');
-		} else {
-		    op(data, 'p');
-		}
-		op(data, 'm');
-		break;
-
-	    /* \P -> AM/PM */
-	    case 'P':
-		if (time->tm_hour < 12) {
-		    op(data, 'A');
-		} else {
-		    op(data, 'P');
-		}
-		op(data, 'M');
-		break;
-
-	    /* \T -> time (HH:MM:SS) */
-	    case 'T':
-	    {
-		char d[10], *dp;
-		snprintf(d, sizeof(d), "%2.2d:%2.2d:%2.2d",
-			 time->tm_hour, time->tm_min, time->tm_sec);
-		for (dp = d; *dp; dp++)
-		    op(data, *dp);
-		break;
-	    }
-
-	    /* \e -> epoc (seconds since Jan 1, 1970) */
-	    case 'e':
-	    {
-		char d[30], *dp;
-		snprintf(d, sizeof(d), "%ld", tv->tv_sec);
-		for (dp = d; *dp; dp++)
-		    op(data, *dp);
-		break;
-	    }
-
-	    /* \U -> microseconds in the current second */
-	    case 'U':
-	    {
-		char d[10], *dp;
-		snprintf(d, sizeof(d), "%6.6ld", tv->tv_usec);
-		for (dp = d; *dp; dp++)
-		    op(data, *dp);
-		break;
-	    }
-
-	    /* \I -> remote IP address (in dot format) */
-	    case 'I':
-	    {
-		char ip[100], *ipp;
-		if (!getnameinfo((struct sockaddr *) &(port->remote),
-				 sizeof(port->remote),
-				 ip, sizeof(ip), NULL, 0, NI_NUMERICHOST))
-		    break;
-		for (ipp = ip; *ipp; ipp++)
-		    op(data, *ipp);
-		break;
-	    }
-
 	    default:
-		op(data, *s);
+		add_port_tcp_char(tcp, *s);
 	    }
 	} else
-	    op(data, *s);
+	    add_port_tcp_char(tcp, *s);
 	s++;
     }
 }
 
-static void
-count_op(void *data, char c)
-{
-    unsigned int *idata = data;
-
-    (*idata)++;
-}
-
-struct bufop_data {
-    unsigned int pos;
-    char *str;
+enum fn_tr_state {
+    TR_NORMAL, TR_ESC, TR_ESCx1, TR_ESCx2, TR_ESCo1, TR_ESCo2
 };
 
-static void
-buffer_op(void *data, char c)
+static char *smonths[] = { "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+			   "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+static char *sdays[] = { "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
+
+static int
+translate_filename(port_info_t *port, const char *raw,
+		   char *cooked, unsigned int cooked_len,
+		   const struct timeval *tv)
 {
-    struct bufop_data *bufop = data;
-    bufop->str[bufop->pos] = c;
-    (bufop->pos)++;
+    const char *s = raw;
+    enum fn_tr_state state = TR_NORMAL;
+    char c = 0;
+    unsigned int left;
+    char *cooked_end = cooked + cooked_len;
+    int rv;
+    struct tm time;
+    int v;
+    char *t;
+
+
+    localtime_r(&tv->tv_sec, &time);
+
+    while (*s) {
+	left = cooked_end - cooked;
+	if (!left)
+	    return -1;
+
+	if (state == TR_NORMAL) {
+	    if (*s == '\\')
+		state = TR_ESC;
+	    else
+		*cooked++ = *s;
+	    goto nextchar;
+	}
+
+	if (state == TR_ESCx1 || state == TR_ESCx2) {
+	    int v;
+
+	    if (!isxdigit(*s))
+		return -1;
+	    if (isdigit(*s))
+		v = *s - '0';
+	    else if (isupper(*s))
+		v = *s - 'A' + 10;
+	    else
+		v = *s - 'a' + 10;
+	    c = (c << 4) | v;
+
+	    if (state == TR_ESCx2) {
+		*cooked++ = c;
+		state = TR_NORMAL;
+	    } else
+		state = TR_ESCx2;
+	}
+
+	if (state == TR_ESCo1 || state == TR_ESCo2) {
+	    if (*s < '0' || *s > '7')
+		return -1;
+	    c = (c << 4) | (*s - '0');
+
+	    if (state == TR_ESCo2) {
+		*cooked++ = c;
+		state = TR_NORMAL;
+	    } else
+		state = TR_ESCo2;
+	}
+
+	switch (*s) {
+        /* \\ -> \ */
+	case '\\':
+	    *cooked++ = '\\';
+	    break;
+
+	case 'a':
+	    *cooked++ = 7;
+	    break;
+
+	case 'b':
+	    *cooked++ = 8;
+	    break;
+
+	case 'f':
+	    *cooked++ = 12;
+	    break;
+
+	case 'n':
+	    *cooked++ = 10;
+	    break;
+
+	case 'r':
+	    *cooked++ = 13;
+	    break;
+
+	case 't':
+	    *cooked++ = 9;
+	    break;
+
+	case 'v':
+	    *cooked++ = 11;
+	    break;
+
+	case '\'':
+	    *cooked++ = '\'';
+	    break;
+
+	case '?':
+	    *cooked++ = '?';
+	    break;
+
+	case '"':
+	    *cooked++ = '"';
+	    break;
+
+        /* \nnn -> octal value of nnn */
+	case '0': case '1': case '2': case '3': case '4': case '5':
+	case '6': case '7':
+	    state = TR_ESCo1;
+	    c = *s - '0';
+	    break;
+
+        /* \xXX -> hex value of XX */
+	case 'x':
+	    state = TR_ESCx1;
+	    c = 0;
+	    break;
+
+        /* \Y -> year */
+	case 'Y':
+	    rv = snprintf(cooked, left, "%d", time.tm_year + 1900);
+	    if ((unsigned int) rv > left)
+		return -1;
+	    cooked += rv;
+	    break;
+
+        /* \y -> day of the year (days since Jan 1) */
+	case 'y':
+	    rv = snprintf(cooked, left, "%d", time.tm_yday);
+	    if ((unsigned int) rv > left)
+		return -1;
+	    cooked += rv;
+	    break;
+
+        /* \M -> month (Jan, Feb, Mar, etc.) */
+	case 'M':
+	    if (time.tm_mon >= 12)
+		*cooked++ = '?';
+	    else {
+		rv = snprintf(cooked, left, "%s", smonths[time.tm_mon]);
+		if ((unsigned int) rv > left)
+		    return -1;
+		cooked += rv;
+	    }
+	    break;
+
+        /* \m -> month (as a number) */
+	case 'm':
+	    rv = snprintf(cooked, left, "%d", time.tm_mon);
+	    if ((unsigned int) rv > left)
+		return -1;
+	    cooked += rv;
+	    break;
+
+        /* \A -> day of the week (Mon, Tue, etc.) */
+	case 'A':
+	    if (time.tm_mon >= 12)
+		*cooked++ = '?';
+	    else {
+		rv = snprintf(cooked, left, "%s", sdays[time.tm_wday]);
+		if ((unsigned int) rv > left)
+		    return -1;
+		cooked += rv;
+	    }
+	    break;
+
+        /* \D -> day of the month */
+	case 'D':
+	    rv = snprintf(cooked, left, "%d", time.tm_mday);
+	    if ((unsigned int) rv > left)
+		return -1;
+	    cooked += rv;
+	    break;
+
+        /* \H -> hour (24-hour time) */
+	case 'H':
+	    rv = snprintf(cooked, left, "%2.2d", time.tm_hour);
+	    if ((unsigned int) rv > left)
+		return -1;
+	    cooked += rv;
+	    break;
+
+        /* \h -> hour (12-hour time) */
+	case 'h':
+	    v = time.tm_hour;
+	    if (v == 0)
+		v = 12;
+	    else if (v > 12)
+		v -= 12;
+	    rv = snprintf(cooked, left, "%2.2d", v);
+	    if ((unsigned int) rv > left)
+		return -1;
+	    cooked += rv;
+	    break;
+
+        /* \i -> minute */
+	case 'i':
+	    rv = snprintf(cooked, left, "%2.2d", time.tm_min);
+	    if ((unsigned int) rv > left)
+		return -1;
+	    cooked += rv;
+	    break;
+
+        /* \s -> second */
+	case 's':
+	    rv = snprintf(cooked, left, "%2.2d", time.tm_sec);
+	    if ((unsigned int) rv > left)
+		return -1;
+	    cooked += rv;
+	    break;
+
+        /* \q -> am/pm */
+	case 'q':
+	    if (time.tm_hour < 12)
+		rv = snprintf(cooked, left, "am");
+	    else
+		rv = snprintf(cooked, left, "pm");
+	    if ((unsigned int) rv > left)
+		return -1;
+	    cooked += rv;
+	    break;
+
+        /* \P -> AM/PM */
+	case 'P':
+	    if (time.tm_hour < 12)
+		rv = snprintf(cooked, left, "AM");
+	    else
+		rv = snprintf(cooked, left, "PM");
+	    if ((unsigned int) rv > left)
+		return -1;
+	    cooked += rv;
+	    break;
+
+        /* \T -> time (HH:MM:SS) */
+	case 'T':
+	    rv = snprintf(cooked, left, "%2.2d:%2.2d:%2.2d",
+			  time.tm_hour, time.tm_min, time.tm_sec);
+	    if ((unsigned int) rv > left)
+		return -1;
+	    cooked += rv;
+	    break;
+
+        /* \e -> epoc (seconds since Jan 1, 1970) */
+	case 'e':
+	    rv = snprintf(cooked, left, "%ld", tv->tv_sec);
+	    if ((unsigned int) rv > left)
+		return -1;
+	    cooked += rv;
+	    break;
+
+        /* \U -> microseconds in the current second */
+	case 'U':
+	    rv = snprintf(cooked, left, "%6.6ld", tv->tv_usec);
+	    if ((unsigned int) rv > left)
+		return -1;
+	    cooked += rv;
+	    break;
+
+        /* \p -> local port number */
+	case 'p':
+	    rv = snprintf(cooked, left, "%s", port->portname);
+	    if ((unsigned int) rv > left)
+		return -1;
+	    cooked += rv;
+	    break;
+
+        /* \d -> local device name */
+	case 'd':
+	    /* Remove everything but the device name. */
+	    t = strrchr(port->devname, '/');
+	    if (t)
+		t++;
+	    else
+		t = port->devname;
+	    rv = snprintf(cooked, left, "%s", t);
+	    if ((unsigned int) rv > left)
+		return -1;
+	    cooked += rv;
+	    break;
+
+        /* \I -> remote IP address (in dot format) */
+	case 'I':
+	    if (!inet_ntop(AF_INET, &(port->remote.sin_addr), cooked, left))
+		return -1;
+	    while (*cooked)
+		cooked++;
+	    break;
+
+	default:
+	    return -1;
+	}
+
+	if (state == TR_ESC)
+	    state = TR_NORMAL;
+
+    nextchar:
+	s++;
+    }
+
+    if (state != TR_NORMAL)
+	/* Trailing \ is an error */
+	return -1;
+
+    left = cooked_end - cooked;
+    if (!left)
+	/* No room for the terminator */
+	return -1;
+
+    *cooked = '\0';
+
+    return 0;
 }
 
-static char *
-process_str_to_str(port_info_t *port, char *str, struct timeval *tv,
-		   unsigned int *lenrv, int isfilename)
-{
-    unsigned int len = 0;
-    struct tm now;
-    struct bufop_data bufop;
-
-    localtime_r(&tv->tv_sec, &now);
-    process_str(port, &now, tv, str, count_op, &len, isfilename);
-    if (!lenrv)
-	/* If we don't return a length, append a nil char. */
-	len++;
-    bufop.pos = 0;
-    if (len == 0)
-	/* malloc(0) sometimes return NULL */
-	bufop.str = malloc(1);
-    else
-	bufop.str = malloc(len);
-    if (!bufop.str) {
-	syslog(LOG_ERR, "Out of memory processing string: %s", port->portname);
-	return NULL;
-    }
-    process_str(port, &now, tv, str, buffer_op, &bufop, isfilename);
-
-    if (lenrv)
-	*lenrv = len;
-    else
-	bufop.str[bufop.pos] = '\0';
-
-    return bufop.str;
-}
-
-static struct sbuf *
-process_str_to_buf(port_info_t *port, char *str)
-{
-    char *bstr;
-    struct sbuf *buf;
-    unsigned int len;
-    struct timeval tv;
-
-    if (!str)
-	return NULL;
-    gettimeofday(&tv, NULL);
-
-    buf = malloc(sizeof(*buf));
-    if (!buf) {
-	syslog(LOG_ERR, "Out of memory processing string: %s", port->portname);
-	return NULL;
-    }
-    bstr = process_str_to_str(port, str, &tv, &len, 0);
-    if (!bstr) {
-	free(buf);
-	syslog(LOG_ERR, "Error processing string: %s", port->portname);
-	return NULL;
-    }
-    buffer_init(buf, (unsigned char *) bstr, len);
-    buf->cursize = len;
-    return buf;
-}
-
-static void
-open_trace_file(port_info_t *port, 
-                trace_info_t *in,
-                trace_t *out,
-                struct timeval *tv)
+static int
+open_trace_file(port_info_t *port, const char *trfilename, struct timeval *tv)
 {
     int rv;
-    char *trfilename = in->file;
-    char *trfile;
+    char trfile[FILENAME_MAX];
 
-    trfile = process_str_to_str(port, trfilename, tv, NULL, 1);
-    if (!trfile) {
+    rv = translate_filename(port, trfilename, trfile, sizeof(trfile), tv);
+    if (rv == -1) {
 	syslog(LOG_ERR, "Unable to translate trace file %s", trfilename);
-	out->file = -1;
-	return;
+	goto out;
     }
 
     rv = open(trfile, O_WRONLY | O_CREAT | O_APPEND, 0600);
@@ -1763,13 +1669,8 @@ open_trace_file(port_info_t *port,
 	    syslog(LOG_ERR, "Unable to open trace file %s: %s",
 		   trfile, errbuf);
     }
-    else {
-        out->hexdump = in->hexdump;
-        out->timestamp = in->timestamp;
-    }
-
-    free(trfile);
-    out->file = rv;
+ out:
+    return rv;
 }
 
 static void
@@ -1777,46 +1678,36 @@ setup_trace(port_info_t *port)
 {
     struct timeval tv;
 
-    /* Only get the time once so all trace files have consistent times. */
     gettimeofday(&tv, NULL);
 
-    if (port->dinfo.trace_write.file)
-	open_trace_file(port, &port->dinfo.trace_write, &port->wt, &tv);
+    if (port->dinfo.trace_write)
+	port->wt_file = open_trace_file(port, port->dinfo.trace_write, &tv);
     else
-	port->wt.file = -1;
+	port->wt_file = -1;
 
-    if (port->dinfo.trace_read.file) {
-	if (port->dinfo.trace_write.file
-	    && (strcmp(port->dinfo.trace_read.file,
-		       port->dinfo.trace_write.file) == 0)) {
-	    port->rt.file = port->wt.file;
-	    port->rt.timestamp = port->wt.timestamp;
-	    port->rt.hexdump   = port->wt.hexdump;
+    if (port->dinfo.trace_read) {
+	if (port->dinfo.trace_write
+	    && (strcmp(port->dinfo.trace_read, port->dinfo.trace_write) == 0)){
+	    port->rt_file = port->wt_file;
 	    goto try_both;
 	}
-	open_trace_file(port, &port->dinfo.trace_read, &port->rt, &tv);
+	port->rt_file = open_trace_file(port, port->dinfo.trace_read, &tv);
     } else
-	port->rt.file = -1;
+	port->rt_file = -1;
  try_both:
-    if (port->dinfo.trace_both.file) {
-	if (port->dinfo.trace_write.file
-	    && (strcmp(port->dinfo.trace_both.file,
-		       port->dinfo.trace_write.file) == 0)) {
-	    port->bt.file = port->wt.file;
-	    port->bt.timestamp = port->wt.timestamp;
-	    port->bt.hexdump   = port->wt.hexdump;
+    if (port->dinfo.trace_both) {
+	if (port->dinfo.trace_write
+	    && (strcmp(port->dinfo.trace_both, port->dinfo.trace_write) == 0)){
+	    port->bt_file = port->wt_file;
 	    goto out;
-	} else if (port->dinfo.trace_read.file
-	    && (strcmp(port->dinfo.trace_both.file,
-		       port->dinfo.trace_read.file) == 0)) {
-	    port->bt.file = port->rt.file;
-	    port->bt.timestamp = port->rt.timestamp;
-	    port->bt.hexdump   = port->rt.hexdump;
+	} else if (port->dinfo.trace_read
+	    && (strcmp(port->dinfo.trace_both, port->dinfo.trace_read) == 0)){
+	    port->bt_file = port->rt_file;
 	    goto out;
 	}
-	open_trace_file(port, &port->dinfo.trace_both, &port->bt, &tv);
+	port->bt_file = open_trace_file(port, port->dinfo.trace_both, &tv);
     } else
-	port->bt.file = -1;
+	port->bt_file = -1;
  out:
     return;
 }
@@ -1826,20 +1717,16 @@ static int
 setup_tcp_port(port_info_t *port, tcp_info_t *tcp)
 {
     int options;
-    sel_fd_handler_t tcp_write_handler;
-    sel_fd_handler_t dev_write_handler;
 
     if (fcntl(tcp->tcpfd, F_SETFL, O_NONBLOCK) == -1) {
 	close(tcp->tcpfd);
-	tcp->tcpfd = -1;
 	syslog(LOG_ERR, "Could not fcntl the tcp port %s: %m", port->portname);
 	return -1;
     }
     options = 1;
-    if (setsockopt(tcp->tcpfd, IPPROTO_TCP, TCP_NODELAY,
+    if (tcp->tcpfd && setsockopt(tcp->tcpfd, IPPROTO_TCP, TCP_NODELAY,
 		   (char *) &options, sizeof(options)) == -1) {
 	close(tcp->tcpfd);
-	tcp->tcpfd = -1;
 	syslog(LOG_ERR, "Could not enable TCP_NODELAY tcp port %s: %m",
 	       port->portname);
 	return -1;
@@ -1856,7 +1743,6 @@ setup_tcp_port(port_info_t *port, tcp_info_t *tcp)
 	    char *err = "Access denied\n\r";
 	    write(tcp->tcpfd, err, strlen(err));
 	    close(tcp->tcpfd);
-	    tcp->tcpfd = -1;
 	    return -1;
 	}
     }
@@ -1874,17 +1760,15 @@ setup_tcp_port(port_info_t *port, tcp_info_t *tcp)
 	    char *err;
 
 	    err = "Port already in use by another process\n\r";
-	    write_ignore_fail(tcp->tcpfd, err, strlen(err));
+	    write(tcp->tcpfd, err, strlen(err));
 	    close(tcp->tcpfd);
-	    tcp->tcpfd = -1;
 	    return -1;
 	} else if (rv < 0) {
 	    char *err;
 
 	    err = "Error creating port lock file\n\r";
-	    write_ignore_fail(tcp->tcpfd, err, strlen(err));
+	    write(tcp->tcpfd, err, strlen(err));
 	    close(tcp->tcpfd);
-	    tcp->tcpfd = -1;
 	    return -1;
 	}
     }
@@ -1901,7 +1785,6 @@ setup_tcp_port(port_info_t *port, tcp_info_t *tcp)
     port->devfd = open(port->devname, options);
     if (port->devfd == -1) {
 	close(tcp->tcpfd);
-	tcp->tcpfd = -1;
 	syslog(LOG_ERR, "Could not open device %s for port %s: %m",
 	       port->devname,
 	       port->portname);
@@ -1916,9 +1799,7 @@ setup_tcp_port(port_info_t *port, tcp_info_t *tcp)
         && tcsetattr(port->devfd, TCSANOW, &(port->dinfo.termctl)) == -1)
     {
 	close(tcp->tcpfd);
-	tcp->tcpfd = -1;
 	close(port->devfd);
-	port->devfd = -1;
 	syslog(LOG_ERR, "Could not set up device %s for port %s: %m",
 	       port->devname,
 	       port->portname);
@@ -1939,24 +1820,13 @@ setup_tcp_port(port_info_t *port, tcp_info_t *tcp)
     port->is_2217 = 0;
     port->break_set = 0;
 
-    port->devstr = process_str_to_buf(port, port->dinfo.openstr);
-    if (port->devstr)
-	dev_write_handler = handle_dev_fd_devstr_write;
-    else
-	dev_write_handler = handle_dev_fd_write;
-
-    if (port->dinfo.closestr)
-	port->closestr = strdup(port->dinfo.closestr);
-    else
-	port->closestr = NULL;
-
     sel_set_fd_handlers(ser2net_sel,
 			port->devfd,
 			port,
 			port->enabled == PORT_RAWLP
 			? NULL
 			: handle_dev_fd_read,
-			dev_write_handler,
+			handle_dev_fd_write,
 			handle_dev_fd_except);
     sel_set_fd_read_handler(ser2net_sel,
 			    port->devfd,
@@ -1966,29 +1836,15 @@ setup_tcp_port(port_info_t *port, tcp_info_t *tcp)
     sel_set_fd_except_handler(ser2net_sel, port->devfd,
 			      SEL_FD_HANDLER_ENABLED);
 
-    setup_trace(port);
-    header_trace(port);
-
-    if (port->devstr)
-	sel_set_fd_write_handler(ser2net_sel, port->devfd,
-				 SEL_FD_HANDLER_ENABLED);
-
     /* end of if (PORT_IS_FREE(port))*/
     }
 
-    tcp->banner = process_str_to_buf(port, port->dinfo.banner);
-    if (tcp->banner)
-	tcp_write_handler = handle_tcp_fd_banner_write;
-    else
-	tcp_write_handler = handle_tcp_fd_write;
-
     tcp->dev_to_tcp_state = PORT_WAITING_INPUT;
-
     sel_set_fd_handlers(ser2net_sel,
 			tcp->tcpfd,
 			port,
 			handle_tcp_fd_read,
-			tcp_write_handler,
+			handle_tcp_fd_write,
 			handle_tcp_fd_except);
     sel_set_fd_read_handler(ser2net_sel, tcp->tcpfd,
 			    SEL_FD_HANDLER_ENABLED);
@@ -2008,18 +1864,17 @@ setup_tcp_port(port_info_t *port, tcp_info_t *tcp)
 		    telnet_cmds,
 		    telnet_init_seq, sizeof(telnet_init_seq));
     } else if(PORT_HTTP == port->enabled) {
-	sel_set_fd_read_handler(ser2net_sel, port->devfd, SEL_FD_HANDLER_DISABLED);
-	sel_set_fd_write_handler(ser2net_sel, tcp->tcpfd, SEL_FD_HANDLER_DISABLED);
-	http_init(&tcp->ht_data, tcp, http_output_ready, http_to_dev_buf);
+        sel_set_fd_read_handler(ser2net_sel, port->devfd, SEL_FD_HANDLER_DISABLED);
+        http_init(&tcp->ht_data, tcp, http_output_ready, http_to_dev_buf, http_to_tcp_buf);
     } else {
-	buffer_init(&tcp->tn_data.out_telnet_cmd, NULL, 0);
-	buffer_init(&tcp->ht_data.request, NULL, 0);
-	buffer_init(&tcp->ht_data.response, NULL, 0);
 	sel_set_fd_read_handler(ser2net_sel, port->devfd,
 				SEL_FD_HANDLER_ENABLED);
-	if (tcp->banner)
-	    sel_set_fd_write_handler(ser2net_sel, tcp->tcpfd,
-				     SEL_FD_HANDLER_ENABLED);
+    }
+
+    display_banner(port, tcp);
+
+    if (PORT_IS_FREE(port)) {
+	setup_trace(port);
     }
 
     tick_timer(tcp->timer);
@@ -2037,7 +1892,6 @@ handle_accept_port_read(int fd, void *data)
     socklen_t len;
     tcp_info_t *tcp;
     char *err = NULL;
-    int optval;
 
     if (port->tcp_to_dev_state != PORT_UNCONNECTED) {
 	/* we enable multi-connections now */
@@ -2047,12 +1901,12 @@ handle_accept_port_read(int fd, void *data)
     }
 
     if (err != NULL) {
-	struct sockaddr_storage dummy_sockaddr;
+	struct sockaddr_in dummy_sockaddr;
 	socklen_t len = sizeof(dummy_sockaddr);
 	int new_fd = accept(fd, (struct sockaddr *) &dummy_sockaddr, &len);
 
 	if (new_fd != -1) {
-	    write_ignore_fail(new_fd, err, strlen(err));
+	    write(new_fd, err, strlen(err));
 	    close(new_fd);
 	}
 	return;
@@ -2060,39 +1914,33 @@ handle_accept_port_read(int fd, void *data)
 
     tcp = tcp_new(-1);
     len = sizeof(tcp->remote);
-
     tcp->tcpfd = accept(fd, (struct sockaddr *) &(tcp->remote), &len);
     if (tcp->tcpfd == -1) {
+	tcp_free(tcp);
 	syslog(LOG_ERR, "Could not accept on port %s: %m", port->portname);
 	return;
     }
 
-    optval = 1;
-    if (setsockopt(tcp->tcpfd, SOL_SOCKET, SO_KEEPALIVE, (void *)&optval,
-		   sizeof(optval)) == -1) {
-	close(tcp->tcpfd);
-	syslog(LOG_ERR, "Could not enable SO_KEEPALIVE on tcp port %s: %m",
-	       port->portname);
-	return;
-    }
-
-    /* XXX log port->remote */
-    if (setup_tcp_port(port, tcp) == -1)
+    if (setup_tcp_port(port, tcp) == -1) {
 	tcp_free(tcp);
+    }
 }
 
 /* Start monitoring for connections on a specific port. */
 static char *
 startup_port(port_info_t *port)
 {
-    if (port->is_stdio) {
+    int optval = 1;
+
+    if (port->tcpport.sin_port == 0) {
+	/* A zero port means use stdin/stdout */
 	if (is_device_already_inuse(port)) {
 	    char *err = "Port's device already in use\n\r";
-	    write_ignore_fail(0, err, strlen(err));
+	    write(0, err, strlen(err));
 	    exit(1);
 	} else {
 	    tcp_info_t *tcp;
-	    port->acceptfds = NULL;
+	    port->acceptfd = -1;
 	    tcp = tcp_new(0);   /* stdin */
 	    if (setup_tcp_port(port, tcp) == -1) {
 		tcp_free(tcp);
@@ -2102,41 +1950,63 @@ startup_port(port_info_t *port)
 	return NULL;
     }
 
-    if (port->is_client) {
-	port->acceptfds = connect_socket(port->ai, &port->nr_acceptfds);
-	if (port->acceptfds == NULL) {
+    port->acceptfd = socket(PF_INET, SOCK_STREAM, 0);
+    if (port->acceptfd == -1) {
+	return "Unable to create TCP socket";
+    }
+
+    if (PORT_REMOTE_RAW == port->enabled) {
+	tcp_info_t *tcp;
+	if (connect(port->acceptfd, (struct sockaddr *) &port->tcpport, sizeof(port->tcpport)) == -1) {
+	    close(port->acceptfd);
 	    syslog(LOG_ERR, "Unable to connect to remote port: %m. Reconnect after %d seconds", port->restart_timeout);
 	    reset_restart_timer(port);
 	    tick_timer(port->restart_timer);
 	    return NULL;
 	}
-	if (port->nr_acceptfds > 0) {
-	    /* TODO process only the first by now */
-	    tcp_info_t *tcp = tcp_new(port->acceptfds[0]);
-	    memcpy(&tcp->remote, &port->ai->ai_addr, port->ai->ai_addrlen);
-	    if (setup_tcp_port(port, tcp) == -1)
-		    tcp_free(tcp);
-	}
+	tcp = tcp_new(port->acceptfd);
+	memcpy(&tcp->remote, &port->tcpport, sizeof(tcp->remote));
+	if (setup_tcp_port(port, tcp) == -1)
+	    tcp_free(tcp);
 	return NULL;
     }
 
-    port->acceptfds = open_socket(port->ai, handle_accept_port_read, port,
-				  &port->nr_acceptfds);
+    if (fcntl(port->acceptfd, F_SETFL, O_NONBLOCK) == -1) {
+	close(port->acceptfd);
+	return "Could not fcntl the accept port";
+    }
 
-    if (port->acceptfds == NULL)
-	return "Unable to create TCP socket";
+    if (setsockopt(port->acceptfd,
+		   SOL_SOCKET,
+		   SO_REUSEADDR,
+		   (void *)&optval,
+		   sizeof(optval)) == -1) {
+	close(port->acceptfd);
+	return "Unable to set reuseaddress on socket";
+    }
+
+    if (bind(port->acceptfd,
+	     (struct sockaddr *) &port->tcpport,
+	     sizeof(port->tcpport)) == -1) {
+	close(port->acceptfd);
+	return "Unable to bind TCP port";
+    }
+
+    if (listen(port->acceptfd, 1) != 0) {
+	close(port->acceptfd);
+	return "Unable to listen to TCP port";
+    }
+
+    sel_set_fd_handlers(ser2net_sel,
+			port->acceptfd,
+			port,
+			handle_accept_port_read,
+			NULL,
+			NULL);
+    sel_set_fd_read_handler(ser2net_sel, port->acceptfd,
+			    SEL_FD_HANDLER_ENABLED);
 
     return NULL;
-}
-
-static void
-redo_port_handlers(port_info_t *port)
-{
-    unsigned int i;
-
-    for (i = 0; i < port->nr_acceptfds; i++)
-	sel_set_fd_handlers(ser2net_sel, port->acceptfds[i], port,
-			    handle_accept_port_read, NULL, NULL);
 }
 
 char *
@@ -2144,22 +2014,18 @@ change_port_state(port_info_t *port, int state)
 {
     char *rv = NULL;
 
-    if (port->enabled == state)
+    if (port->enabled == state) {
 	return rv;
+    }
 
     if (state == PORT_DISABLED) {
-	if (port->acceptfds != NULL) {
-	    unsigned int i;
-
-	    for (i = 0; i < port->nr_acceptfds; i++) {
-		sel_set_fd_read_handler(ser2net_sel,
-					port->acceptfds[i],
-					SEL_FD_HANDLER_DISABLED);
-		sel_clear_fd_handlers(ser2net_sel, port->acceptfds[i]);
-		close(port->acceptfds[i]);
-	    }
-	    free(port->acceptfds);
-	    port->acceptfds = NULL;
+	if (port->acceptfd != -1) {
+	    sel_set_fd_read_handler(ser2net_sel,
+				    port->acceptfd,
+				    SEL_FD_HANDLER_DISABLED);
+	    sel_clear_fd_handlers(ser2net_sel, port->acceptfd);
+	    close(port->acceptfd);
+	    port->acceptfd = -1;
 	}
     } else if (port->enabled == PORT_DISABLED) {
 	rv = startup_port(port);
@@ -2174,58 +2040,81 @@ static void
 free_port(port_info_t *port)
 {
     change_port_state(port, PORT_DISABLED);
-    if (port->portname)
+    if (!PORT_IS_FREE(port)) {
+	tcp_shutdown_all(port->tcp_list, NULL);
+	port->tcp_list = NULL;
+    }
+    if (port->portname != NULL) {
 	free(port->portname);
-    if (port->devname)
+    }
+    if (port->devname != NULL) {
 	free(port->devname);
-    if (port->new_config)
+    }
+    if (port->new_config != NULL) {
 	free_port(port->new_config);
-    if (port->ai)
-	freeaddrinfo(port->ai);
-    if (port->acceptfds)
-	free(port->acceptfds);
-    if (port->restart_timer)
+    }
+    if (port->restart_timer != NULL) {
 	sel_free_timer(port->restart_timer);
+    }
     free(port);
 }
 
 static void
-finish_shutdown_port(port_info_t *port)
+shutdown_port(port_info_t *port, tcp_info_t *tcp, char *reason)
 {
+    if (tcp) {
+	/* shutdown tcp */
+	tcp_shutdown(tcp, reason);
+	tcp = NULL;
+    } else if (!PORT_IS_FREE(port)) {
+	/* shutdown all tcp */
+	tcp_shutdown_all(port->tcp_list, reason);
+	port->tcp_list = NULL;
+    }
+
+    if (!PORT_IS_FREE(port))
+	return;
+
+    D("shutdown port %s\n", port->portname)
+
+    if (port->wt_file != -1) {
+	close(port->wt_file);
+	if (port->rt_file == port->wt_file)
+	    port->rt_file = -1;
+	if (port->bt_file == port->wt_file)
+	    port->bt_file = -1;
+	port->wt_file = -1;
+    }
+    if (port->rt_file != -1) {
+	close(port->rt_file);
+	if (port->bt_file == port->rt_file)
+	    port->bt_file = -1;
+	port->rt_file = -1;
+    }
+    if (port->bt_file != -1) {
+	close(port->bt_file);
+	port->bt_file = -1;
+    }
+    sel_clear_fd_handlers(ser2net_sel, port->devfd);
     /* To avoid blocking on close if we have written bytes and are in
        flow-control, we flush the output queue. */
-    if (port->devfd != -1) {
-	sel_clear_fd_handlers(ser2net_sel, port->devfd);
-	tcflush(port->devfd, TCOFLUSH);
-	close(port->devfd);
-	port->devfd = -1;
-    }
+    tcflush(port->devfd, TCOFLUSH);
+    close(port->devfd);
 #ifdef USE_UUCP_LOCKING
     uucp_rm_lock(port->devname);
 #endif /* USE_UUCP_LOCKING */
     port->tcp_to_dev_state = PORT_UNCONNECTED;
-    buffer_reset(&port->tcp_to_dev);
-    port->tcp_bytes_received = 0;
-    port->tcp_bytes_sent = 0;
-    if (port->devstr) {
-	free(port->devstr->buf);
-	free(port->devstr);
-	port->devstr = NULL;
-    }
-    if (port->closestr) {
-	free(port->closestr);
-	port->closestr = NULL;
-    }
-    port->dev_to_tcp_state = PORT_UNCONNECTED;
-    buffer_reset(&port->dev_to_tcp);
+    port->tcp_to_dev_buf_start = 0;
+    port->tcp_to_dev_buf_count = 0;
     port->dev_bytes_received = 0;
     port->dev_bytes_sent = 0;
 
-    if (port->is_stdio)
+    if (port->tcpport.sin_port == 0) {
 	/* This was a zero port (for stdin/stdout), this is only
 	   allowed with one port at a time, and we shut down when it
 	   closes. */
 	exit(0);
+    }
 
     /* If the port has been disabled, then delete it.  Check this before
        the new config so the port will be deleted properly and not
@@ -2233,7 +2122,6 @@ finish_shutdown_port(port_info_t *port)
     if (port->config_num == -1) {
 	port_info_t *curr, *prev;
 
-	change_port_state(port, PORT_DISABLED);
 	prev = NULL;
 	curr = ports;
 	while ((curr != NULL) && (curr != port)) {
@@ -2241,20 +2129,17 @@ finish_shutdown_port(port_info_t *port)
 	    curr = curr->next;
 	}
 	if (curr != NULL) {
-	    if (prev == NULL)
+	    if (prev == NULL) {
 		ports = curr->next;
-	    else
+	    } else {
 		prev->next = curr->next;
+	    }
 	    free_port(curr);
 	}
 
 	return; /* We have to return here because we no longer have a port. */
     }
 
-    /*
-     * The configuration for this port has changed, install it now that
-     * the user has closed the connection.
-     */
     if (port->new_config != NULL) {
 	port_info_t *curr, *prev;
 
@@ -2266,10 +2151,14 @@ finish_shutdown_port(port_info_t *port)
 	}
 	if (curr != NULL) {
 	    port = curr->new_config;
-	    port->acceptfds = curr->acceptfds;
-	    port->nr_acceptfds = curr->nr_acceptfds;
-	    curr->acceptfds = NULL;
-	    redo_port_handlers(port);
+	    port->acceptfd = curr->acceptfd;
+	    sel_set_fd_handlers(ser2net_sel,
+				port->acceptfd,
+				port,
+				handle_accept_port_read,
+				NULL,
+				NULL);
+	    curr->acceptfd = -1;
 	    port->next = curr->next;
 	    if (prev == NULL) {
 		ports = port;
@@ -2281,116 +2170,6 @@ finish_shutdown_port(port_info_t *port)
 	    free_port(curr);
 	}
     }
-}
-
-static void
-shutdown_port(port_info_t *port, tcp_info_t *tcp, char *reason)
-{
-    tcp_info_t *curr = NULL, *next = NULL;
-
-    if (tcp) {
-	/* shutdown tcp */
-	tcp_shutdown(tcp, reason);
-    } else {
-	/* shutdown all */
-	curr = port->tcp_list;
-	while (curr) {
-	    next = curr->next;
-	    tcp_shutdown(curr, reason);
-	    curr = next;
-	}
-    }
-
-    if (PORT_IS_FREE(port)) {
-
-    D("shutdown port %s\n", port->portname)
-
-    footer_trace(port, reason);
-    
-    if (port->wt.file != -1) {
-	close(port->wt.file);
-	if (port->rt.file == port->wt.file)
-	    port->rt.file = -1;
-	if (port->bt.file == port->wt.file)
-	    port->bt.file = -1;
-	port->wt.file = -1;
-    }
-    if (port->rt.file != -1) {
-	close(port->rt.file);
-	if (port->bt.file == port->rt.file)
-	    port->bt.file = -1;
-	port->rt.file = -1;
-    }
-    if (port->bt.file != -1) {
-	close(port->bt.file);
-	port->bt.file = -1;
-    }
-
-    if (port->devstr) {
-	free(port->devstr->buf);
-	free(port->devstr);
-    }
-    port->devstr = process_str_to_buf(port, port->closestr);
-    if (port->devstr && (port->devfd != -1)) {
-	port->tcp_to_dev_state = PORT_CLOSING;
-	sel_set_fd_read_handler(ser2net_sel, port->devfd,
-				SEL_FD_HANDLER_DISABLED);
-	sel_set_fd_except_handler(ser2net_sel, port->devfd,
-				  SEL_FD_HANDLER_DISABLED);
-	sel_set_fd_handlers(ser2net_sel,
-			    port->devfd,
-			    port,
-			    NULL,
-			    handle_dev_fd_close_write,
-			    NULL);
-	sel_set_fd_write_handler(ser2net_sel, port->devfd,
-				 SEL_FD_HANDLER_ENABLED);
-    } else
-	finish_shutdown_port(port);
-  } /* PORT_IS_FREE */
-}
-
-void
-got_timeout(selector_t  *sel,
-	    sel_timer_t *timer,
-	    void        *data)
-{
-    tcp_info_t *tcp = (tcp_info_t *) data;
-    port_info_t *port = tcp->port;
-    unsigned char modemstate;
-    int val;
-
-    if (tcp->timeout) {
-	tcp->timeout_left--;
-	if (tcp->timeout_left < 0) {
-	    shutdown_port(port, tcp, "timeout");
-	    return;
-	}
-    }
-
-    if (port->is_2217 && (ioctl(port->devfd, TIOCMGET, &val) != -1)) {
-	modemstate = 0;
-	if (val & TIOCM_CD)
-	    modemstate |= 0x80;
-	if (val & TIOCM_RI)
-	    modemstate |= 0x40;
-	if (val & TIOCM_DSR)
-	    modemstate |= 0x20;
-	if (val & TIOCM_CTS)
-	    modemstate |= 0x10;
-
-	modemstate &= port->modemstate_mask;
-	if (modemstate != port->last_modemstate) {
-	    unsigned char data[3];
-	    data[0] = TN_OPT_COM_PORT;
-	    data[1] = 107; /* Notify modemstate */
-	    data[2] = modemstate;
-	    port->last_modemstate = modemstate;
-	    telnet_send_option(&tcp->tn_data, data, 3);
-	}
-    }
-    
-    tick_timer(tcp->timer);
 }
 
 static void
@@ -2410,17 +2189,6 @@ got_restart_timeout(selector_t  *sel,
     }
 
     tick_timer(port->restart_timer);
-}
-
-static int
-isallzero(char *str)
-{
-    if (*str == '\0')
-	return 0;
-
-    while (*str == '0')
-	str++;
-    return *str == '\0';
 }
 
 /* Create a port based on a set of parameters passed in. */
@@ -2450,15 +2218,14 @@ portconfig(char *portnum,
     /* Errors from here on out must goto errout. */
     init_port_data(new_port);
 
-    new_port->portname = strdup(portnum);
-    if (!new_port->portname) {
+    new_port->portname = malloc(strlen(portnum)+1);
+    if (new_port->portname == NULL) {
 	rv = "unable to allocate port name";
 	goto errout;
     }
+    strcpy(new_port->portname, portnum);
 
-    if (isallzero(new_port->portname)) {
-	new_port->is_stdio = 1;
-    } else if (scan_tcp_port(new_port->portname, &new_port->ai)) {
+    if (scan_tcp_port(portnum, &(new_port->tcpport)) == -1) {
 	rv = "port number was invalid";
 	goto errout;
     }
@@ -2473,7 +2240,6 @@ portconfig(char *portnum,
 	new_port->enabled = PORT_DISABLED;
     } else if (strcmp(state, "rraw") == 0) {
 	new_port->enabled = PORT_REMOTE_RAW;
-	new_port->is_client = 1;
     } else if (strcmp(state, "http") == 0) {
 	new_port->enabled = PORT_HTTP;
     } else {
@@ -2495,14 +2261,11 @@ portconfig(char *portnum,
 
     devinit(&(new_port->dinfo.termctl));
 
-    if (devconfig(devcfg, &new_port->dinfo) == -1) {
+    if (devconfig(devcfg, &new_port->dinfo) == -1)
+    {
 	  rv = "device configuration invalid";
 	  goto errout;
     }
-
-    /* set default signature, if none provided */
-    if (!new_port->dinfo.signature)
-        new_port->dinfo.signature = rfc2217_signature;
 
     new_port->devname = malloc(strlen(devname) + 1);
     if (new_port->devname == NULL) {
@@ -2524,11 +2287,15 @@ portconfig(char *portnum,
 		int new_state = new_port->enabled;
 
 		new_port->enabled = curr->enabled;
-		new_port->acceptfds = curr->acceptfds;
-		new_port->nr_acceptfds = curr->nr_acceptfds;
+		new_port->acceptfd = curr->acceptfd;
 		curr->enabled = PORT_DISABLED;
-		curr->acceptfds = NULL;
-		redo_port_handlers(new_port);
+		curr->acceptfd = -1;
+		sel_set_fd_handlers(ser2net_sel,
+				    new_port->acceptfd,
+				    new_port,
+				    handle_accept_port_read,
+				    NULL,
+				    NULL);
 
 		/* Just replace with the new data. */
 		if (prev == NULL) {
@@ -2561,8 +2328,9 @@ portconfig(char *portnum,
 
     if (new_port->enabled != PORT_DISABLED) {
 	rv = startup_port(new_port);
-	if (rv)
+	if (rv != NULL) {
 	    goto errout;
+	}
     }
 
     /* Tack it on to the end of the list of ports. */
@@ -2620,7 +2388,7 @@ clear_old_port_config(int curr_config)
 static void
 showshortport(struct controller_info *cntlr, port_info_t *port)
 {
-    char buffer[NI_MAXHOST], portbuff[NI_MAXSERV];
+    char buffer[128];
     int  count;
     int  need_space = 0;
 
@@ -2633,13 +2401,10 @@ showshortport(struct controller_info *cntlr, port_info_t *port)
     sprintf(buffer, "%7d ", port->timeout);
     controller_output(cntlr, buffer, strlen(buffer));
 
-    getnameinfo((struct sockaddr *) &(port->remote), sizeof(port->remote),
-		    buffer, sizeof(buffer),
-		    portbuff, sizeof(portbuff),
-		    NI_NUMERICHOST | NI_NUMERICSERV);
+    inet_ntop(AF_INET, &(port->remote.sin_addr), buffer, sizeof(buffer));
     count = strlen(buffer);
     controller_output(cntlr, buffer, count);
-    sprintf(buffer, ",%s ", portbuff);
+    sprintf(buffer, ",%d ", ntohs(port->remote.sin_port));
     count += strlen(buffer);
     controller_output(cntlr, buffer, strlen(buffer));
     while (count < 23) {
@@ -2690,7 +2455,7 @@ static void
 showport(struct controller_info *cntlr, port_info_t *port)
 {
     char *str;
-    char buffer[NI_MAXHOST], portbuff[NI_MAXSERV];
+    char buffer[128];
 
     str = "TCP Port ";
     controller_output(cntlr, str, strlen(str));
@@ -2712,13 +2477,10 @@ showport(struct controller_info *cntlr, port_info_t *port)
 
     str = "  connected to (or last connection): ";
     controller_output(cntlr, str, strlen(str));
-    getnameinfo((struct sockaddr *) &(port->remote), sizeof(port->remote),
-		    buffer, sizeof(buffer),
-		    portbuff, sizeof(portbuff),
-		    NI_NUMERICHOST | NI_NUMERICSERV);
+    inet_ntop(AF_INET, &(port->remote.sin_addr), buffer, sizeof(buffer));
     controller_output(cntlr, buffer, strlen(buffer));
     controller_output(cntlr, ":", 1);
-    sprintf(buffer, ",%s ", portbuff);
+    sprintf(buffer, "%d", ntohs(port->remote.sin_port));
     controller_output(cntlr, buffer, strlen(buffer));
     controller_output(cntlr, "\n\r", 2);
 
@@ -3107,7 +2869,7 @@ static struct baud_rates_s {
 int
 get_baud_rate(int rate, int *val)
 {
-    unsigned int i;
+    int i;
     for (i=0; i<BAUD_RATES_LEN; i++) {
 	if (cisco_ios_baud_rates) {
 	    if (rate == baud_rates[i].cisco_ios_val) {
@@ -3128,12 +2890,12 @@ get_baud_rate(int rate, int *val)
 void
 get_rate_from_baud_rate(int baud_rate, int *val)
 {
-    unsigned int i;
+    int i;
     for (i=0; i<BAUD_RATES_LEN; i++) {
 	if (baud_rate == baud_rates[i].val) {
 	    if (cisco_ios_baud_rates) {
 		if (baud_rates[i].cisco_ios_val < 0)
-		    /* We are at a baud rate unsupported by the
+		    /* We are at a baud rate unsopported by the
 		       enumeration, just return zero. */
 		    *val = 0;
 		else
@@ -3188,7 +2950,7 @@ com_port_handler(void *cb_data, unsigned char *option, int len)
 {
     tcp_info_t *tcp = (tcp_info_t *) cb_data;
     port_info_t *port = tcp->port;
-    unsigned char outopt[MAX_TELNET_CMD_XMIT_BUF];
+    unsigned char outopt[16];
     struct termios termio;
     int val;
     
@@ -3197,18 +2959,11 @@ com_port_handler(void *cb_data, unsigned char *option, int len)
 
     switch (option[1]) {
     case 0: /* SIGNATURE? */
-	{
-		/* truncate signature, if it exceeds buffer size */
-		int sign_len = strlen(port->dinfo.signature);
-		if (sign_len > (MAX_TELNET_CMD_XMIT_BUF - 2))
-			sign_len = MAX_TELNET_CMD_XMIT_BUF - 2;
-
-		outopt[0] = 44;
-		outopt[1] = 100;
-		strncpy((char *) outopt+2, port->dinfo.signature, sign_len);
-		telnet_send_option(&tcp->tn_data, outopt, 2 + sign_len);
+	outopt[0] = 44;
+	outopt[1] = 100;
+	strcpy((char *) outopt+2, "ser2net");
+	telnet_send_option(&tcp->tn_data, outopt, 9);
 	break;
-	}
 
     case 1: /* SET-BAUDRATE */
 	if (cisco_ios_baud_rates) {
@@ -3218,13 +2973,7 @@ com_port_handler(void *cb_data, unsigned char *option, int len)
 	} else {
 	    if (len < 6)
 		return;
-	    /* Basically the same as:
-	     *  val = ntohl(*((uint32_t *) (option+2)));
-	     * but handled unaligned cases */
-	    val = option[2] << 24;
-	    val |= option[3] << 16;
-	    val |= option[4] << 8;
-	    val |= option[5];
+	    val = ntohl(*((uint32_t *) (option+2)));
 	}
 
 	if (tcgetattr(port->devfd, &termio) != -1) {
@@ -3246,13 +2995,7 @@ com_port_handler(void *cb_data, unsigned char *option, int len)
 	    outopt[2] = val;
 	    telnet_send_option(&tcp->tn_data, outopt, 3);
 	} else {
-	    /* Basically the same as:
-	     * *((uint32_t *) (outopt+2)) = htonl(val);
-	     * but handles unaligned cases */
-	    outopt[2] = val >> 24;
-	    outopt[3] = val >> 16;
-	    outopt[4] = val >> 8;
-	    outopt[5] = val;
+	    *((uint32_t *) (outopt+2)) = htonl(val);
 	    telnet_send_option(&tcp->tn_data, outopt, 6);
 	}
 	break;
@@ -3550,22 +3293,4 @@ com_port_handler(void *cb_data, unsigned char *option, int len)
     default:
 	break;
     }
-}
-
-void
-shutdown_ports(void)
-{
-    port_info_t *port = ports;
-    
-    while (port != NULL) {
-	port->config_num = -1;
-	shutdown_port(port, NULL, "program shutdown");
-	port = port->next;
-    }
-}
-
-int
-check_ports_shutdown(void)
-{
-    return ports == NULL;
 }

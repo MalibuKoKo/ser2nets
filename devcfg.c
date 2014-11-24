@@ -72,8 +72,6 @@ devconfig(char *instr, dev_info_t *dinfo)
     char *strtok_data;
     int  rv = 0;
     struct termios *termctl = &dinfo->termctl;
-    enum str_type stype;
-    char *s;
 
     str = strdup(instr);
     if (str == NULL) {
@@ -83,26 +81,14 @@ devconfig(char *instr, dev_info_t *dinfo)
     dinfo->allow_2217 = 0;
     dinfo->disablebreak = 0;
     dinfo->banner = NULL;
-    dinfo->signature = NULL;
-    dinfo->openstr = NULL;
-    dinfo->closestr = NULL;
-    dinfo->trace_read.file = NULL;
-    dinfo->trace_read.hexdump = 0;
-    dinfo->trace_read.timestamp = 0;
-    dinfo->trace_write.file = NULL;
-    dinfo->trace_write.hexdump = 0;
-    dinfo->trace_write.timestamp = 0;
-    dinfo->trace_both.file = NULL;
-    dinfo->trace_both.hexdump = 0;
-    dinfo->trace_both.timestamp = 0;
+    dinfo->trace_read = NULL;
+    dinfo->trace_write = NULL;
+    dinfo->trace_both = NULL;
     pos = strtok_r(str, ", \t", &strtok_data);
     while (pos != NULL) {
 	if (strcmp(pos, "300") == 0) {
 	    cfsetospeed(termctl, B300);
 	    cfsetispeed(termctl, B300);
-	} else if (strcmp(pos, "600") == 0) {
-	    cfsetospeed(termctl, B600);
-	    cfsetispeed(termctl, B600);
 	} else if (strcmp(pos, "1200") == 0) {
 	    cfsetospeed(termctl, B1200);
 	    cfsetispeed(termctl, B1200);
@@ -127,71 +113,6 @@ devconfig(char *instr, dev_info_t *dinfo)
 	} else if (strcmp(pos, "115200") == 0) {
 	    cfsetospeed(termctl, B115200);
 	    cfsetispeed(termctl, B115200);
-#ifdef B230400
-	} else if (strcmp(pos, "230400") == 0) {
-	    cfsetospeed(termctl, B230400);
-	    cfsetispeed(termctl, B230400);
-#endif
-#ifdef B460800
-	} else if (strcmp(pos, "460800") == 0) {
-	    cfsetospeed(termctl, B460800);
-	    cfsetispeed(termctl, B460800);
-#endif
-#ifdef B500000
-	} else if (strcmp(pos, "500000") == 0) {
-	    cfsetospeed(termctl, B500000);
-	    cfsetispeed(termctl, B500000);
-#endif
-#ifdef B576000
-	} else if (strcmp(pos, "576000") == 0) {
-	    cfsetospeed(termctl, B576000);
-	    cfsetispeed(termctl, B576000);
-#endif
-#ifdef B921600
-	} else if (strcmp(pos, "921600") == 0) {
-	    cfsetospeed(termctl, B921600);
-	    cfsetispeed(termctl, B921600);
-#endif
-#ifdef B1000000
-	} else if (strcmp(pos, "1000000") == 0) {
-	    cfsetospeed(termctl, B1000000);
-	    cfsetispeed(termctl, B1000000);
-#endif
-#ifdef B1152000
-	} else if (strcmp(pos, "1152000") == 0) {
-	    cfsetospeed(termctl, B1152000);
-	    cfsetispeed(termctl, B1152000);
-#endif
-#ifdef B1500000
-	} else if (strcmp(pos, "1500000") == 0) {
-	    cfsetospeed(termctl, B1500000);
-	    cfsetispeed(termctl, B1500000);
-#endif
-#ifdef B2000000
-	} else if (strcmp(pos, "2000000") == 0) {
-	    cfsetospeed(termctl, B2000000);
-	    cfsetispeed(termctl, B2000000);
-#endif
-#ifdef B2500000
-	} else if (strcmp(pos, "2500000") == 0) {
-	    cfsetospeed(termctl, B2500000);
-	    cfsetispeed(termctl, B2500000);
-#endif
-#ifdef B3000000
-	} else if (strcmp(pos, "3000000") == 0) {
-	    cfsetospeed(termctl, B3000000);
-	    cfsetispeed(termctl, B3000000);
-#endif
-#ifdef B3500000
-	} else if (strcmp(pos, "3500000") == 0) {
-	    cfsetospeed(termctl, B3500000);
-	    cfsetispeed(termctl, B3500000);
-#endif
-#ifdef B4000000
-	} else if (strcmp(pos, "4000000") == 0) {
-	    cfsetospeed(termctl, B4000000);
-	    cfsetispeed(termctl, B4000000);	    
-#endif
 	} else if (strcmp(pos, "1STOPBIT") == 0) {
 	    termctl->c_cflag &= ~(CSTOPB);
 	} else if (strcmp(pos, "2STOPBITS") == 0) {
@@ -231,54 +152,18 @@ devconfig(char *instr, dev_info_t *dinfo)
 	    dinfo->allow_2217 = 1;
 	} else if (strcmp(pos, "NOBREAK") == 0) {
 	    dinfo->disablebreak = 1;
-	} else if (strcmp(pos, "hexdump") == 0 ||
-	           strcmp(pos, "-hexdump") == 0) {
-	    dinfo->trace_read.hexdump = (*pos != '-');
-	    dinfo->trace_write.hexdump = (*pos != '-');
-	    dinfo->trace_both.hexdump = (*pos != '-');
-	} else if (strcmp(pos, "timestamp") == 0 ||
-	           strcmp(pos, "-timestamp") == 0) {
-	    dinfo->trace_read.timestamp = (*pos != '-');
-	    dinfo->trace_write.timestamp = (*pos != '-');
-	    dinfo->trace_both.timestamp = (*pos != '-');
-	} else if (strcmp(pos, "tr-hexdump") == 0 ||
-	           strcmp(pos, "-tr-hexdump") == 0) {
-	    dinfo->trace_read.hexdump = (*pos != '-');
-	} else if (strcmp(pos, "tr-timestamp") == 0 ||
-	           strcmp(pos, "-tr-timestamp") == 0) {
-	    dinfo->trace_read.timestamp = (*pos != '-');
-	} else if (strcmp(pos, "tw-hexdump") == 0 ||
-	           strcmp(pos, "-tw-hexdump") == 0) {
-	    dinfo->trace_write.hexdump = (*pos != '-');
-	} else if (strcmp(pos, "tw-timestamp") == 0 ||
-	           strcmp(pos, "-tw-timestamp") == 0) {
-	    dinfo->trace_write.timestamp = (*pos != '-');
-	} else if (strcmp(pos, "tb-hexdump") == 0 ||
-	           strcmp(pos, "-tb-hexdump") == 0) {
-	    dinfo->trace_both.hexdump = (*pos != '-');
-	} else if (strcmp(pos, "tb-timestamp") == 0 ||
-	           strcmp(pos, "-tb-timestamp") == 0) {
-	    dinfo->trace_both.timestamp = (*pos != '-');
 	} else if (strncmp(pos, "tr=", 3) == 0) {
 	    /* trace read, data from the port to the socket */
-	    dinfo->trace_read.file = find_tracefile(pos + 3);
+	    dinfo->trace_read = find_tracefile(pos + 3);
 	} else if (strncmp(pos, "tw=", 3) == 0) {
 	    /* trace write, data from the socket to the port */
-	    dinfo->trace_write.file = find_tracefile(pos + 3);
+	    dinfo->trace_write = find_tracefile(pos + 3);
 	} else if (strncmp(pos, "tb=", 3) == 0) {
 	    /* trace both directions. */
-	    dinfo->trace_both.file = find_tracefile(pos + 3);
-	} else if ((s = find_str(pos, &stype))) {
-	    /* It's a startup banner, signature or open/close string,
-	       it's already set. */
-	    switch (stype) {
-	    case BANNER: dinfo->banner = s; break;
-	    case SIGNATURE: dinfo->signature = s; break;
-	    case OPENSTR: dinfo->openstr = s; break;
-	    case CLOSESTR: dinfo->closestr = s; break;
-	    }
+	    dinfo->trace_both = find_tracefile(pos + 3);
+	} else if ((dinfo->banner = find_banner(pos))) {
+	    /* It's a banner to display at startup, it's already set. */
 	} else {
-	    /* fprintf( stderr, "Unknown token %s\n", pos );     */
 	    rv = -1;
 	    goto out;
 	}
@@ -297,7 +182,6 @@ baud_string(int speed)
     char *str;
     switch (speed) {
     case B300: str = "300"; break;
-    case B600: str = "600"; break;
     case B1200: str = "1200"; break;
     case B2400: str = "2400"; break;
     case B4800: str = "4800"; break;
@@ -306,45 +190,6 @@ baud_string(int speed)
     case B38400: str = "38400"; break;
     case B57600: str = "57600"; break;
     case B115200: str = "115200"; break;
-#ifdef B230400
-    case B230400: str = "230400"; break;
-#endif
-#ifdef B460800
-    case B460800: str = "460800"; break;
-#endif
-#ifdef B500000
-    case B500000: str = "500000"; break;
-#endif
-#ifdef B576000
-    case B576000: str = "576000"; break;
-#endif
-#ifdef B921600
-    case B921600: str = "921600"; break;
-#endif
-#ifdef B1000000
-    case B1000000: str = "1000000"; break;
-#endif
-#ifdef B1152000
-    case B1152000: str = "1152000"; break;
-#endif
-#ifdef B1500000
-    case B1500000: str = "1500000"; break;
-#endif
-#ifdef B2000000
-    case B2000000: str = "2000000"; break;
-#endif
-#ifdef B2500000
-    case B2500000: str = "2500000"; break;
-#endif
-#ifdef B3000000
-    case B3000000: str = "3000000"; break;
-#endif
-#ifdef B3500000
-    case B3500000: str = "3500000"; break;
-#endif
-#ifdef B4000000
-    case B4000000: str = "4000000"; break;
-#endif
     default: str = "unknown speed";
     }
     return str;

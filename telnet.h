@@ -2,8 +2,6 @@
 #ifndef _SER2NET_TELNET_H
 #define _SER2NET_TELNET_H
 
-#include <buffer.h>
-
 /* Telnet commands */
 #define TN_BREAK 243
 #define TN_WILL	251
@@ -61,8 +59,8 @@ struct telnet_data_s
     /* Outgoing telnet commands.  The output routines should look at
        this *first* to see if they should transmit some data from
        here. */
-    struct sbuf out_telnet_cmd;
-    unsigned char out_telnet_cmdbuf[MAX_TELNET_CMD_XMIT_BUF];
+    unsigned char out_telnet_cmd[MAX_TELNET_CMD_XMIT_BUF];
+    int           out_telnet_cmd_size;
 
     /* Marks that an output error occurred.  The only error that can
        occur is "out of space", meaning that the code needed to do
@@ -105,8 +103,5 @@ void telnet_init(telnet_data_t *td,
 /* Set to true if we are supposed to do CISCO IOS baud rates instead
    of RFC2217 ones. */
 extern int cisco_ios_baud_rates;
-
-/* The default rfc2217 signature if none is provided. */
-extern char *rfc2217_signature;
 
 #endif /* _SER2NET_TELNET_H */
