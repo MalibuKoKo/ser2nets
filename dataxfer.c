@@ -574,12 +574,12 @@ static void
 tcp_print_list_impl(list_node_t *tcp_list)
 {
     list_node_t *node = tcp_list;
-    D("[D] tcps:")
+    //D("[D] tcps:")
     while (node) {
-	D(" %d", ((tcp_info_t *) node->data)->tcpfd)
+	//D(" %d", ((tcp_info_t *) node->data)->tcpfd)
 	node = node->next;
     }
-    D("\n")
+    //D("\n")
 }
 
 static int
@@ -654,7 +654,7 @@ tcp_remove(port_info_t *port, tcp_info_t *tcp)
 static void
 tcp_shutdown(tcp_info_t *tcp, char *reason)
 {
-    D("tcp %d shutdown: %s\n", tcp->tcpfd, reason)
+    //D("tcp %d shutdown: %s\n", tcp->tcpfd, reason)
     tcp_close(tcp);
     tcp_remove(tcp->port, tcp);
 }
@@ -667,7 +667,7 @@ tcp_shutdown_all(list_node_t *queue, char *reason)
 	return;
     tcp_shutdown_all(queue->next, reason);
     tcp = (tcp_info_t *) queue->data;
-    D("tcp %d shutdown: %s\n", tcp->tcpfd, reason)
+    //D("tcp %d shutdown: %s\n", tcp->tcpfd, reason)
     tcp_close(tcp);
     tcp_free(tcp);
     list_delete_node(queue);
@@ -688,7 +688,7 @@ tcp_set_fd_write_handler(tcp_info_t *tcp, int state)
 	while (node) {
 	    t = (tcp_info_t *)node->data;
 	    if (t->dev_to_tcp_buf_count != 0) {
-		D("tcp %d still has %d\n", t->tcpfd, t->dev_to_tcp_buf_count)
+//		D("tcp %d still has %d\n", t->tcpfd, t->dev_to_tcp_buf_count)
 		return;
 	    }
 	    node = node->next;
@@ -2076,7 +2076,7 @@ shutdown_port(port_info_t *port, tcp_info_t *tcp, char *reason)
     if (!PORT_IS_FREE(port))
 	return;
 
-    D("shutdown port %s\n", port->portname)
+    //D("shutdown port %s\n", port->portname)
 
     if (port->wt_file != -1) {
 	close(port->wt_file);
