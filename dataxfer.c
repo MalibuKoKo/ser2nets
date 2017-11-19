@@ -902,6 +902,7 @@ handle_tcp_fd_read(int fd, void *data)
 {
     port_info_t *port = (port_info_t *) data;
     tcp_info_t *tcp = NULL;
+
     int write_count;
 
     tcp = tcp_find_in_port(port, fd);
